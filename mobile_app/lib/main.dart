@@ -28,7 +28,7 @@ const int kMinRssi = -75;
 const Duration kScanTimeout = Duration(seconds: 8);
 
 /// Default Backend URL (fallback when not configured by user)
-const String kDefaultApiBaseUrl = 'http://192.168.1.100:8000';
+const String kDefaultApiBaseUrl = 'http://10.127.162.188:8000';
 
 /// Local Push Notification Channel IDs
 const String kNotificationChannelId = 'classroom_ble_channel';
@@ -552,8 +552,18 @@ class _StudentRegisterScreenState extends State<StudentRegisterScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Cannot connect to server at $serverUrl. Check IP / Wi-Fi.'),
+          content: Text('Cannot connect to server at $serverUrl.\nPlease ensure Phone and Laptop are on the same Wi-Fi / Hotspot.'),
           backgroundColor: Colors.red,
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    } on TimeoutException {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Connection timed out to $serverUrl.\nCheck if Laptop IP is correct (e.g. http://10.127.162.188:8000) and backend server is running.'),
+          backgroundColor: Colors.red,
+          duration: const Duration(seconds: 6),
         ),
       );
     } catch (e) {
@@ -666,7 +676,8 @@ class _StudentRegisterScreenState extends State<StudentRegisterScreen> {
                     labelText: 'Server Base URL',
                     hintText: 'http://<LAPTOP_IP>:8000',
                     prefixIcon: const Icon(Icons.dns),
-                    helperText: 'Enter your laptop/server Wi-Fi IP and port 8000',
+                    helperText: 'Laptop & Phone same Wi-Fi pe honi chahiye (e.g. http://10.127.162.188:8000)',
+                    helperMaxLines: 2,
                     filled: true,
                     fillColor: Colors.white,
                     border: OutlineInputBorder(
