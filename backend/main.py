@@ -1,0 +1,925 @@
+"""
+Face Recognition Attendance System — FastAPI + SQLite
+=====================================================
+
+A self-contained backend that:
+  • Stores student data (roll_no, name, face_encoding) in SQLite.
+  • Stores attendance records (roll_no, date, time, status) in SQLite.
+  • Exposes POST /register   — register a student with a photo.
+  • Exposes POST /verify     — verify a live photo and mark attendance.
+  • Exposes POST /end_class  — end a class, generate an Excel attendance
+                                report, and email it to the teacher.
+
+Run with:
+    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import os
+import smtplib
+import tempfile
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import List
+
+import aiosqlite
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+# Try importing real face_recognition (requires dlib), fallback to PIL-based mock if not installed
+try:
+    import face_recognition
+    USE_REAL_FR = True
+except ImportError:
+    USE_REAL_FR = False
+    import hashlib
+    from PIL import Image
+
+logger = logging.getLogger("attendance")
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DATABASE_PATH = "attendance.db"
+FACE_MATCH_TOLERANCE = 0.6  # lower = stricter matching
+
+# ---------------------------------------------------------------------------
+# SMTP / Email configuration  (override via environment variables)
+# ---------------------------------------------------------------------------
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "your_email@gmail.com")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "your_app_password")
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", SMTP_USER)
+
+# ---------------------------------------------------------------------------
+# Timetable mapping & strict attendance window configuration
+# ---------------------------------------------------------------------------
+# Key  : (weekday_name, hour_24)  — e.g. ("Monday", 9) means 09:00-09:59
+# Value: dict with "subject", "teacher_email", "start_minute", and "allowed_window_minutes"
+#
+# Students can only mark attendance within `allowed_window_minutes` (default 10)
+# after class start time.
+# ---------------------------------------------------------------------------
+
+ATTENDANCE_WINDOW_MINUTES = 10  # Strict 10-minute allowed attendance window
+
+TIMETABLE: dict[tuple[str, int], dict[str, any]] = {
+    # ── Monday ────────────────────────────────────────────────────────────
+    ("Monday", 9):  {"subject": "Mathematics",        "teacher_email": "gupta@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Monday", 10): {"subject": "Physics",             "teacher_email": "verma@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Monday", 11): {"subject": "Basic Electronics",   "teacher_email": "sharma@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Monday", 14): {"subject": "Data Structures",     "teacher_email": "singh@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    # ── Tuesday ───────────────────────────────────────────────────────────
+    ("Tuesday", 9):  {"subject": "Chemistry",          "teacher_email": "patel@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Tuesday", 10): {"subject": "English",            "teacher_email": "mehta@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Tuesday", 11): {"subject": "Basic Electronics",  "teacher_email": "sharma@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Tuesday", 14): {"subject": "Computer Networks",  "teacher_email": "kumar@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    # ── Wednesday ─────────────────────────────────────────────────────────
+    ("Wednesday", 9):  {"subject": "Mathematics",      "teacher_email": "gupta@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Wednesday", 10): {"subject": "Physics",          "teacher_email": "verma@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Wednesday", 11): {"subject": "Digital Logic",    "teacher_email": "rao@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Wednesday", 14): {"subject": "Data Structures",  "teacher_email": "singh@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    # ── Thursday ──────────────────────────────────────────────────────────
+    ("Thursday", 9):  {"subject": "Chemistry",         "teacher_email": "patel@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Thursday", 10): {"subject": "English",           "teacher_email": "mehta@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Thursday", 11): {"subject": "Basic Electronics", "teacher_email": "sharma@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Thursday", 14): {"subject": "Computer Networks", "teacher_email": "kumar@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    # ── Friday ────────────────────────────────────────────────────────────
+    ("Friday", 9):  {"subject": "Mathematics",         "teacher_email": "gupta@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Friday", 10): {"subject": "Physics Lab",         "teacher_email": "verma@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Friday", 11): {"subject": "Digital Logic",       "teacher_email": "rao@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+    ("Friday", 14): {"subject": "Project Work",        "teacher_email": "singh@college.edu", "start_minute": 0, "allowed_window_minutes": 10},
+}
+
+
+def get_class_info(dt: datetime | None = None) -> dict[str, any] | None:
+    """
+    Look up the timetable for the given datetime (defaults to *now*).
+
+    Returns ``{"subject": ..., "teacher_email": ..., "start_minute": ..., "allowed_window_minutes": ...}``
+    or ``None`` if no class is scheduled for that slot.
+    """
+    if dt is None:
+        dt = datetime.now()
+    day_name = dt.strftime("%A")      # e.g. "Monday"
+    hour = dt.hour                    # 0-23
+    return TIMETABLE.get((day_name, hour))
+
+
+async def get_class_info_from_db(dt: datetime | None = None) -> dict[str, any] | None:
+    """
+    Look up the timetable in SQLite database first, falling back to memory.
+    """
+    if dt is None:
+        dt = datetime.now()
+    day_name = dt.strftime("%A")
+    hour = dt.hour
+
+    try:
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT day, hour, start_minute, allowed_window_minutes, subject, teacher_email
+                FROM timetable
+                WHERE day = ? AND hour = ?
+                """,
+                (day_name, hour),
+            )
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+        finally:
+            await db.close()
+    except Exception as exc:
+        logger.debug("Could not query timetable table: %s", exc)
+
+    return get_class_info(dt)
+
+
+def check_attendance_window(class_info: dict, dt: datetime | None = None) -> tuple[bool, str, str]:
+    """
+    Strictly validate if the given datetime is within the allowed attendance window.
+    Returns (is_allowed, error_detail, window_end_str).
+    """
+    if dt is None:
+        dt = datetime.now()
+
+    start_hour = class_info.get("hour", dt.hour)
+    start_minute = class_info.get("start_minute", 0)
+    allowed_minutes = class_info.get("allowed_window_minutes", ATTENDANCE_WINDOW_MINUTES)
+
+    class_start = dt.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    window_end = class_start + timedelta(minutes=allowed_minutes)
+    window_end_str = window_end.strftime("%I:%M %p")
+    start_str = class_start.strftime("%I:%M %p")
+
+    if dt < class_start:
+        return False, f"Class has not started yet. Class starts at {start_str}.", window_end_str
+
+    if dt > window_end:
+        return (
+            False,
+            f"Time limit exceeded. Allowed {allowed_minutes}-minute attendance window for {class_info.get('subject', 'class')} ended at {window_end_str}.",
+            window_end_str,
+        )
+
+    return True, "", window_end_str
+
+# ---------------------------------------------------------------------------
+# Excel report generation (pandas)
+# ---------------------------------------------------------------------------
+
+async def generate_attendance_excel(
+    target_date: str,
+    subject: str,
+) -> str:
+    """
+    Query today's attendance, join with the students table, and write an
+    Excel workbook to a temporary file.  Returns the absolute path to the
+    generated ``.xlsx`` file.
+
+    The sheet includes columns: Roll No, Name, Status.
+    Students who verified get "Present"; all others are marked "Absent".
+    """
+    db = await get_db()
+    try:
+        # All registered students
+        cur_students = await db.execute(
+            "SELECT roll_no, name FROM students ORDER BY roll_no"
+        )
+        all_students = await cur_students.fetchall()
+
+        # Students marked present today
+        cur_present = await db.execute(
+            "SELECT DISTINCT roll_no FROM attendance WHERE date = ?",
+            (target_date,),
+        )
+        present_rows = await cur_present.fetchall()
+    finally:
+        await db.close()
+
+    present_roll_nos = {row["roll_no"] for row in present_rows}
+
+    records = []
+    for s in all_students:
+        records.append(
+            {
+                "Roll No": s["roll_no"],
+                "Name": s["name"],
+                "Status": "Present" if s["roll_no"] in present_roll_nos else "Absent",
+            }
+        )
+
+    df = pd.DataFrame(records)
+
+    # Write to a temp .xlsx file
+    tmp_dir = tempfile.mkdtemp()
+    filename = f"Attendance_{subject.replace(' ', '_')}_{target_date}.xlsx"
+    filepath = os.path.join(tmp_dir, filename)
+
+    with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Attendance")
+
+    logger.info("Excel report generated → %s", filepath)
+    return filepath
+
+# ---------------------------------------------------------------------------
+# Email sender (smtplib)
+# ---------------------------------------------------------------------------
+
+def send_email_with_attachment(
+    to_email: str,
+    subject_line: str,
+    body: str,
+    attachment_path: str,
+) -> None:
+    """
+    Send an email with a single ``.xlsx`` attachment via SMTP (TLS).
+
+    Raises on failure so the caller can surface the error to the client.
+    """
+    msg = MIMEMultipart()
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = to_email
+    msg["Subject"] = subject_line
+
+    msg.attach(MIMEText(body, "plain"))
+
+    # Attach the Excel file
+    basename = os.path.basename(attachment_path)
+    with open(attachment_path, "rb") as f:
+        part = MIMEApplication(f.read(), Name=basename)
+    part["Content-Disposition"] = f'attachment; filename="{basename}"'
+    msg.attach(part)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
+
+    logger.info("Email sent to %s — subject: %s", to_email, subject_line)
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
+async def get_db() -> aiosqlite.Connection:
+    """Open (and return) a connection to the SQLite database."""
+    db = await aiosqlite.connect(DATABASE_PATH)
+    db.row_factory = aiosqlite.Row
+    return db
+
+
+async def init_db() -> None:
+    """Create tables if they do not already exist."""
+    db = await get_db()
+    try:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS students (
+                roll_no       TEXT PRIMARY KEY,
+                name          TEXT NOT NULL,
+                face_encoding TEXT NOT NULL   -- JSON-serialised list of 128 floats
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS attendance (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                roll_no TEXT    NOT NULL,
+                date    TEXT    NOT NULL,       -- YYYY-MM-DD
+                time    TEXT    NOT NULL,       -- HH:MM:SS
+                status  TEXT    NOT NULL DEFAULT 'Present',
+                FOREIGN KEY (roll_no) REFERENCES students(roll_no)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS timetable (
+                id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                day                    TEXT    NOT NULL,
+                hour                   INTEGER NOT NULL,
+                start_minute           INTEGER NOT NULL DEFAULT 0,
+                allowed_window_minutes INTEGER NOT NULL DEFAULT 10,
+                subject                TEXT    NOT NULL,
+                teacher_email          TEXT    NOT NULL,
+                UNIQUE(day, hour)
+            )
+            """
+        )
+
+        # Seed timetable table from default entries if empty
+        cursor = await db.execute("SELECT COUNT(*) as count FROM timetable")
+        row = await cursor.fetchone()
+        if row and row["count"] == 0:
+            for (day, hour), info in TIMETABLE.items():
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO timetable (day, hour, start_minute, allowed_window_minutes, subject, teacher_email)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        day,
+                        hour,
+                        info.get("start_minute", 0),
+                        info.get("allowed_window_minutes", 10),
+                        info["subject"],
+                        info["teacher_email"],
+                    ),
+                )
+        await db.commit()
+    finally:
+        await db.close()
+
+# ---------------------------------------------------------------------------
+# Face-encoding utilities
+# ---------------------------------------------------------------------------
+
+async def extract_face_encoding(file: UploadFile) -> List[float]:
+    """Read an uploaded image and return the first 128-d face encoding."""
+    contents = await file.read()
+    if USE_REAL_FR:
+        image = face_recognition.load_image_file(io.BytesIO(contents))
+        encodings = face_recognition.face_encodings(image)
+        if not encodings:
+            raise ValueError("No face detected in the uploaded image. Please try again with a clearer photo.")
+        return encodings[0].tolist()
+    else:
+        # Fallback when face_recognition is not installed
+        try:
+            img = Image.open(io.BytesIO(contents))
+            img.verify()
+        except Exception:
+            raise ValueError("Invalid image file uploaded.")
+        img_hash = hashlib.sha256(contents).digest()
+        rng = np.random.RandomState(int.from_bytes(img_hash[:4], 'big'))
+        return rng.randn(128).tolist()
+
+
+def match_encoding(
+    known_encoding: List[float],
+    unknown_encoding: List[float],
+    tolerance: float = FACE_MATCH_TOLERANCE,
+) -> tuple[bool, float]:
+    """Compare two face encodings. Returns (is_match, distance)."""
+    known = np.array(known_encoding)
+    unknown = np.array(unknown_encoding)
+    if USE_REAL_FR:
+        distance = float(face_recognition.face_distance([known], unknown)[0])
+    else:
+        distance = float(np.linalg.norm(known - unknown))
+    is_match = distance <= tolerance
+    return is_match, distance
+
+# ---------------------------------------------------------------------------
+# Application lifespan — initialise the database on startup
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="Face Recognition Attendance System",
+    version="1.0.0",
+    description="Register students with a photo and verify attendance via face recognition.",
+    lifespan=lifespan,
+)
+
+# Allow requests from any origin (useful for mobile / web front-ends).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+@app.get("/api/health")
+async def health_check():
+    return {"status": "healthy", "message": "Face Recognition Attendance System API is running."}
+
+
+@app.post("/register")
+async def register_student(
+    roll_no: str = Form(..., description="Unique roll number of the student"),
+    name: str = Form(..., description="Full name of the student"),
+    photo: UploadFile = File(..., description="A clear face photo of the student"),
+):
+    """
+    Register a new student.
+
+    Accepts a multipart form with `roll_no`, `name`, and a `photo` file.
+    Extracts the 128-dimensional face encoding and stores it in the database.
+    """
+    # --- Validate image & extract encoding ---
+    try:
+        encoding = await extract_face_encoding(photo)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    encoding_json = json.dumps(encoding)
+
+    # --- Persist to database ---
+    db = await get_db()
+    try:
+        # Check for duplicate roll number
+        cursor = await db.execute(
+            "SELECT roll_no FROM students WHERE roll_no = ?", (roll_no,)
+        )
+        existing = await cursor.fetchone()
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Student with roll number '{roll_no}' is already registered.",
+            )
+
+        await db.execute(
+            "INSERT INTO students (roll_no, name, face_encoding) VALUES (?, ?, ?)",
+            (roll_no, name, encoding_json),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    return {
+        "status": "success",
+        "message": f"Student '{name}' (Roll No: {roll_no}) registered successfully.",
+    }
+
+
+@app.post("/verify")
+async def verify_attendance(
+    photo: UploadFile = File(..., description="A live photo captured from the mobile app"),
+):
+    """
+    Verify a student's identity and mark attendance.
+
+    Accepts a live photo, checks the server's current time against the timetable's
+    10-minute allowed window. If within the window, compares the face encoding against
+    all registered students, and marks the best match as **Present** in the attendance table.
+
+    A student can only be marked present **once per day**.
+    """
+    # ── 1. Strict Time Window Check (Server Time) ──
+    now = datetime.now()
+    class_info = await get_class_info_from_db(now)
+
+    if not class_info:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Time limit exceeded. No scheduled class found for current time ({now.strftime('%A %I:%M %p')}).",
+        )
+
+    is_allowed, time_err, window_end_str = check_attendance_window(class_info, now)
+    if not is_allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=time_err,
+        )
+
+    # ── 2. Extract encoding from the live photo ──
+    try:
+        unknown_encoding = await extract_face_encoding(photo)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # --- Load all registered students ---
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT roll_no, name, face_encoding FROM students")
+        students = await cursor.fetchall()
+
+        if not students:
+            raise HTTPException(
+                status_code=404,
+                detail="No students are registered yet. Please register first.",
+            )
+
+        # --- Find the best matching student ---
+        best_match_roll_no: str | None = None
+        best_match_name: str | None = None
+        best_distance: float = float("inf")
+
+        for student in students:
+            known_encoding = json.loads(student["face_encoding"])
+            is_match, distance = match_encoding(known_encoding, unknown_encoding)
+            if is_match and distance < best_distance:
+                best_distance = distance
+                best_match_roll_no = student["roll_no"]
+                best_match_name = student["name"]
+
+        if best_match_roll_no is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Face did not match any registered student.",
+            )
+
+        # --- Prevent duplicate attendance for the same day ---
+        today = date.today().isoformat()
+        dup_cursor = await db.execute(
+            "SELECT id FROM attendance WHERE roll_no = ? AND date = ?",
+            (best_match_roll_no, today),
+        )
+        duplicate = await dup_cursor.fetchone()
+        if duplicate:
+            return {
+                "status": "already_marked",
+                "message": f"Attendance for '{best_match_name}' (Roll No: {best_match_roll_no}) is already marked for today.",
+                "roll_no": best_match_roll_no,
+                "name": best_match_name,
+            }
+
+        # --- Mark attendance ---
+        now = datetime.now()
+        await db.execute(
+            "INSERT INTO attendance (roll_no, date, time, status) VALUES (?, ?, ?, ?)",
+            (best_match_roll_no, today, now.strftime("%H:%M:%S"), "Present"),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    return {
+        "status": "success",
+        "message": f"Attendance marked for '{best_match_name}' (Roll No: {best_match_roll_no}).",
+        "roll_no": best_match_roll_no,
+        "name": best_match_name,
+        "date": today,
+        "time": now.strftime("%H:%M:%S"),
+    }
+
+
+@app.get("/attendance")
+async def get_attendance(
+    roll_no: str | None = None,
+    date_filter: str | None = None,
+):
+    """
+    Retrieve attendance records, optionally filtered by `roll_no` and/or `date_filter` (YYYY-MM-DD).
+    """
+    db = await get_db()
+    try:
+        query = "SELECT a.roll_no, s.name, a.date, a.time, a.status FROM attendance a JOIN students s ON a.roll_no = s.roll_no WHERE 1=1"
+        params: list = []
+
+        if roll_no:
+            query += " AND a.roll_no = ?"
+            params.append(roll_no)
+        if date_filter:
+            query += " AND a.date = ?"
+            params.append(date_filter)
+
+        query += " ORDER BY a.date DESC, a.time DESC"
+
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+    finally:
+        await db.close()
+
+    records = [
+        {
+            "roll_no": row["roll_no"],
+            "name": row["name"],
+            "date": row["date"],
+            "time": row["time"],
+            "status": row["status"],
+        }
+        for row in rows
+    ]
+
+    return {"status": "success", "count": len(records), "records": records}
+
+
+@app.get("/students")
+async def list_students():
+    """List all registered students (without exposing face encodings)."""
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT roll_no, name FROM students ORDER BY roll_no")
+        rows = await cursor.fetchall()
+    finally:
+        await db.close()
+
+    students = [{"roll_no": row["roll_no"], "name": row["name"]} for row in rows]
+    return {"status": "success", "count": len(students), "students": students}
+
+
+@app.delete("/students/{roll_no}")
+async def delete_student(roll_no: str):
+    """Delete a registered student and their attendance records."""
+    db = await get_db()
+    try:
+        cur = await db.execute("DELETE FROM students WHERE roll_no = ?", (roll_no,))
+        await db.execute("DELETE FROM attendance WHERE roll_no = ?", (roll_no,))
+        await db.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"Student with roll number '{roll_no}' not found.")
+    finally:
+        await db.close()
+    return {"status": "success", "message": f"Student '{roll_no}' deleted successfully."}
+
+
+
+# ---------------------------------------------------------------------------
+# End-of-class reporting
+# ---------------------------------------------------------------------------
+
+@app.post("/end_class")
+async def end_class(
+    subject: str | None = Form(None, description="Override subject name (auto-detected from timetable if omitted)"),
+    teacher_email: str | None = Form(None, description="Override teacher email (auto-detected from timetable if omitted)"),
+):
+    """
+    Trigger the end-of-class workflow:
+
+    1. **Resolve the class** — uses the current time to look up the timetable,
+       or accepts manual ``subject`` / ``teacher_email`` overrides.
+    2. **Generate an Excel report** — queries today's attendance from SQLite,
+       marks every registered student as Present or Absent, and writes an
+       ``.xlsx`` file using pandas.
+    3. **Email the report** — sends the workbook as an attachment to the
+       teacher via SMTP (runs in a FastAPI ``BackgroundTask`` so the response
+       returns immediately).
+    """
+    now = datetime.now()
+    today = date.today().isoformat()
+
+    # --- Resolve class info from timetable or form overrides ---
+    class_info = get_class_info(now)
+
+    resolved_subject = subject or (class_info["subject"] if class_info else None)
+    resolved_email = teacher_email or (class_info["teacher_email"] if class_info else None)
+
+    if not resolved_subject or not resolved_email:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No class is scheduled for the current time slot "
+                f"({now.strftime('%A %H:%M')}). "
+                "Please provide 'subject' and 'teacher_email' manually."
+            ),
+        )
+
+    # --- Generate the Excel attendance report ---
+    try:
+        excel_path = await generate_attendance_excel(today, resolved_subject)
+    except Exception as exc:
+        logger.exception("Failed to generate Excel report")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating attendance report: {exc}",
+        )
+
+    # --- Send email (blocking I/O — kept simple; see note below) ---
+    try:
+        send_email_with_attachment(
+            to_email=resolved_email,
+            subject_line=f"Attendance Report — {resolved_subject} — {today}",
+            body=(
+                f"Dear Professor,\n\n"
+                f"Please find attached the attendance report for "
+                f"'{resolved_subject}' held on {today}.\n\n"
+                f"This report was auto-generated by the Face Recognition "
+                f"Attendance System.\n\n"
+                f"Regards,\n"
+                f"Smart Attendance Bot"
+            ),
+            attachment_path=excel_path,
+        )
+    except Exception as exc:
+        logger.exception("Failed to send email to %s", resolved_email)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Attendance report generated but email delivery failed: {exc}",
+        )
+    finally:
+        # Clean up the temp file
+        try:
+            os.remove(excel_path)
+        except OSError:
+            pass
+
+    return {
+        "status": "success",
+        "message": (
+            f"Attendance report for '{resolved_subject}' emailed to "
+            f"{resolved_email}."
+        ),
+        "subject": resolved_subject,
+        "teacher_email": resolved_email,
+        "date": today,
+    }
+
+
+@app.get("/timetable")
+async def view_timetable():
+    """Return the full timetable with strict attendance windows and current class status."""
+    now = datetime.now()
+    current_class = await get_class_info_from_db(now)
+
+    window_status = None
+    if current_class:
+        is_allowed, reason, window_end_str = check_attendance_window(current_class, now)
+        window_status = {
+            "is_open": is_allowed,
+            "window_end": window_end_str,
+            "message": "Window open for attendance" if is_allowed else reason,
+        }
+
+    schedule = []
+    try:
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT id, day, hour, start_minute, allowed_window_minutes, subject, teacher_email
+                FROM timetable
+                ORDER BY
+                    CASE day
+                        WHEN 'Monday' THEN 1
+                        WHEN 'Tuesday' THEN 2
+                        WHEN 'Wednesday' THEN 3
+                        WHEN 'Thursday' THEN 4
+                        WHEN 'Friday' THEN 5
+                        WHEN 'Saturday' THEN 6
+                        WHEN 'Sunday' THEN 7
+                        ELSE 8
+                    END,
+                    hour ASC,
+                    start_minute ASC
+                """
+            )
+            rows = await cursor.fetchall()
+            for r in rows:
+                h = r["hour"]
+                sm = r["start_minute"]
+                wm = r["allowed_window_minutes"]
+                we_h = h + (sm + wm) // 60
+                we_m = (sm + wm) % 60
+                schedule.append({
+                    "id": r["id"],
+                    "day": r["day"],
+                    "hour": h,
+                    "start_minute": sm,
+                    "allowed_window_minutes": wm,
+                    "time_label": f"{h:02d}:{sm:02d} – {h:02d}:59",
+                    "attendance_window": f"{h:02d}:{sm:02d} – {we_h:02d}:{we_m:02d} ({wm} min window)",
+                    "subject": r["subject"],
+                    "teacher_email": r["teacher_email"],
+                })
+        finally:
+            await db.close()
+    except Exception as exc:
+        logger.warning("Error loading timetable from DB: %s", exc)
+
+    if not schedule:
+        schedule = [
+            {
+                "id": None,
+                "day": day,
+                "hour": hour,
+                "start_minute": info.get("start_minute", 0),
+                "allowed_window_minutes": info.get("allowed_window_minutes", ATTENDANCE_WINDOW_MINUTES),
+                "time_label": f"{hour:02d}:{info.get('start_minute', 0):02d} – {hour:02d}:59",
+                "attendance_window": f"{hour:02d}:{info.get('start_minute', 0):02d} – {hour:02d}:{info.get('start_minute', 0) + info.get('allowed_window_minutes', ATTENDANCE_WINDOW_MINUTES):02d} ({info.get('allowed_window_minutes', ATTENDANCE_WINDOW_MINUTES)} min window)",
+                "subject": info["subject"],
+                "teacher_email": info["teacher_email"],
+            }
+            for (day, hour), info in sorted(
+                TIMETABLE.items(),
+                key=lambda item: (
+                    ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].index(item[0][0]),
+                    item[0][1],
+                ),
+            )
+        ]
+
+    return {
+        "status": "success",
+        "current_slot": {
+            "day": now.strftime("%A"),
+            "hour": now.hour,
+            "time": now.strftime("%H:%M:%S"),
+            "class": current_class,
+            "window_status": window_status,
+        },
+        "timetable": schedule,
+    }
+
+
+@app.post("/timetable")
+async def add_timetable_entry(
+    day: str = Form(..., description="Day of week (e.g. Monday, Tuesday)"),
+    hour: int = Form(..., ge=0, le=23, description="Class start hour (0-23)"),
+    start_minute: int = Form(0, ge=0, le=59, description="Start minute (0-59, default 0)"),
+    allowed_window_minutes: int = Form(10, ge=1, le=60, description="Allowed attendance window in minutes (default 10)"),
+    subject: str = Form(..., description="Subject name"),
+    teacher_email: str = Form(..., description="Teacher email address"),
+):
+    """Add or update a class in the timetable with strict allowed attendance window."""
+    clean_day = day.strip().capitalize()
+    clean_subject = subject.strip()
+    clean_email = teacher_email.strip()
+
+    db = await get_db()
+    try:
+        await db.execute(
+            """
+            INSERT INTO timetable (day, hour, start_minute, allowed_window_minutes, subject, teacher_email)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(day, hour) DO UPDATE SET
+                start_minute = excluded.start_minute,
+                allowed_window_minutes = excluded.allowed_window_minutes,
+                subject = excluded.subject,
+                teacher_email = excluded.teacher_email
+            """,
+            (clean_day, hour, start_minute, allowed_window_minutes, clean_subject, clean_email),
+        )
+        await db.commit()
+
+        # Keep memory cache updated
+        TIMETABLE[(clean_day, hour)] = {
+            "subject": clean_subject,
+            "teacher_email": clean_email,
+            "start_minute": start_minute,
+            "allowed_window_minutes": allowed_window_minutes,
+        }
+    finally:
+        await db.close()
+
+    return {
+        "status": "success",
+        "message": f"Class '{clean_subject}' on {clean_day} at {hour:02d}:{start_minute:02d} ({allowed_window_minutes}-min window) saved successfully.",
+    }
+
+
+@app.delete("/timetable/{item_id}")
+async def delete_timetable_entry(item_id: int):
+    """Delete a class from the timetable."""
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT day, hour, subject FROM timetable WHERE id = ?", (item_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Timetable entry not found.")
+
+        day, hour, subject = row["day"], row["hour"], row["subject"]
+        await db.execute("DELETE FROM timetable WHERE id = ?", (item_id,))
+        await db.commit()
+
+        if (day, hour) in TIMETABLE:
+            del TIMETABLE[(day, hour)]
+    finally:
+        await db.close()
+
+    return {
+        "status": "success",
+        "message": f"Class '{subject}' deleted from timetable.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Frontend Static Files Mount
+# ---------------------------------------------------------------------------
+# Serve frontend directly so opening http://localhost:8000 loads the full Web Dashboard
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+POSSIBLE_FRONTEND_PATHS = [
+    os.path.join(os.path.dirname(BASE_DIR), "frontend"),
+    os.path.join(BASE_DIR, "frontend"),
+    r"D:\RFID\frontend",
+]
+
+for fpath in POSSIBLE_FRONTEND_PATHS:
+    if os.path.isdir(fpath) and os.path.isfile(os.path.join(fpath, "index.html")):
+        app.mount("/", StaticFiles(directory=fpath, html=True), name="frontend")
+        break
+
+
