@@ -37,7 +37,8 @@ void setBeacon() {
 
     oAdvertisementData.setFlags(0x04); // BR_EDR_NOT_SUPPORTED 0x04
 
-    std::string strServiceData = "";
+    // Yahan std::string ko String se replace kar diya gaya hai
+    String strServiceData = "";
     strServiceData += (char)26;     // Length
     strServiceData += (char)0xFF;   // Type: Manufacturer Specific
     strServiceData += oBeacon.getData();

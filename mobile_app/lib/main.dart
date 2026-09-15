@@ -11,26 +11,24 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Configuration
+//  Configuration & Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The iBeacon Proximity UUID broadcast by the classroom ESP32 beacon.
 /// Must match the value flashed onto the ESP32.
 const String kBeaconUUID = '12345678-1234-1234-1234-123456789abc';
 
-/// Minimum RSSI (in dBm) to consider the student "inside the classroom".
-/// Typical BLE range: -30 (very close) → -90 (far away).
+/// Minimum RSSI (in dBm) to consider student inside the classroom.
 const int kMinRssi = -75;
 
 /// How long to scan for the beacon before giving up during manual scan.
 const Duration kScanTimeout = Duration(seconds: 8);
 
-/// FastAPI backend base URL.
-/// • Android emulator → use 10.0.2.2 (maps to host localhost).
-/// • Physical device  → use the machine's LAN IP, e.g. 192.168.1.42.
-const String kApiBaseUrl = 'http://10.0.2.2:8000';
+/// Default Backend URL (fallback when not configured by user)
+const String kDefaultApiBaseUrl = 'http://192.168.1.100:8000';
 
 /// Local Push Notification Channel IDs
 const String kNotificationChannelId = 'classroom_ble_channel';
@@ -50,6 +48,61 @@ final FlutterLocalNotificationsPlugin _localNotifications =
 /// Broadcast stream to trigger face scan screen when notification is tapped
 final StreamController<bool> _openFaceScanTrigger =
     StreamController<bool>.broadcast();
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Profile & Settings Storage Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+class AppSettings {
+  static const String keyIsRegistered = 'is_registered';
+  static const String keyStudentName = 'student_name';
+  static const String keyStudentRoll = 'student_roll';
+  static const String keyServerUrl = 'server_url';
+
+  static Future<bool> isRegistered() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(keyIsRegistered) ?? false;
+  }
+
+  static Future<String> getStudentName() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(keyStudentName) ?? '';
+  }
+
+  static Future<String> getStudentRoll() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(keyStudentRoll) ?? '';
+  }
+
+  static Future<String> getServerUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(keyServerUrl) ?? kDefaultApiBaseUrl;
+  }
+
+  static Future<void> saveProfile({
+    required String name,
+    required String rollNo,
+    required String serverUrl,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(keyIsRegistered, true);
+    await prefs.setString(keyStudentName, name);
+    await prefs.setString(keyStudentRoll, rollNo);
+    await prefs.setString(keyServerUrl, serverUrl);
+  }
+
+  static Future<void> updateServerUrl(String serverUrl) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(keyServerUrl, serverUrl);
+  }
+
+  static Future<void> clearProfile() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(keyIsRegistered);
+    await prefs.remove(keyStudentName);
+    await prefs.remove(keyStudentRoll);
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Local Push Notification Setup
@@ -180,84 +233,66 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     service.on('setAsForeground').listen((event) {
       service.setAsForegroundService();
     });
-    service.on('setAsBackground').listen((event) {
-      service.setAsBackgroundService();
-    });
+    service.setAsForegroundService();
   }
 
   service.on('stopService').listen((event) {
     service.stopSelf();
   });
 
-  // Cooldown tracker to prevent spamming notifications continuously
+  final cleanTargetUUID = kBeaconUUID.replaceAll('-', '').toLowerCase();
   DateTime? lastNotificationTime;
-  const Duration cooldown = Duration(minutes: 5);
 
-  // Periodic background BLE scan loop (runs every 20 seconds)
-  Timer.periodic(const Duration(seconds: 20), (timer) async {
-    // If cooldown is active, skip scan cycle
-    if (lastNotificationTime != null &&
-        DateTime.now().difference(lastNotificationTime!) < cooldown) {
-      return;
-    }
-
+  Timer.periodic(const Duration(seconds: 15), (timer) async {
     try {
-      final isSupported = await FlutterBluePlus.isSupported;
-      if (!isSupported) return;
+      if (lastNotificationTime != null &&
+          DateTime.now().difference(lastNotificationTime!).inMinutes < 5) {
+        return;
+      }
 
-      final adapterState = await FlutterBluePlus.adapterState.first;
-      if (adapterState != BluetoothAdapterState.on) return;
+      final isScanning = FlutterBluePlus.isScanningNow;
+      if (isScanning) return;
 
-      final targetUuid = kBeaconUUID.toLowerCase();
       bool foundBeacon = false;
+      final completer = Completer<bool>();
 
-      final Completer<bool> completer = Completer<bool>();
-      StreamSubscription<List<ScanResult>>? subscription;
-
-      subscription = FlutterBluePlus.onScanResults.listen((results) {
+      final subscription = FlutterBluePlus.scanResults.listen((results) {
         for (final result in results) {
-          if (completer.isCompleted) return;
-
           bool matched = false;
 
-          // ── Method 1: Check advertised service UUIDs ──
-          for (final uuid in result.advertisementData.serviceUuids) {
-            if (uuid.toString().toLowerCase() == targetUuid) {
+          for (final serviceUuid in result.advertisementData.serviceUuids) {
+            final cleanUuid =
+                serviceUuid.toString().replaceAll('-', '').toLowerCase();
+            if (cleanUuid == cleanTargetUUID) {
               matched = true;
               break;
             }
           }
 
-          // ── Method 2: Parse iBeacon manufacturer data (Apple 0x004C) ──
           if (!matched) {
-            final mfData = result.advertisementData.manufacturerData;
-            if (mfData.containsKey(0x004C)) {
-              final data = mfData[0x004C]!;
-              if (data.length >= 18 && data[0] == 0x02 && data[1] == 0x15) {
-                final uuidBytes = data.sublist(2, 18);
-                final hex = uuidBytes
+            final mfgData = result.advertisementData.manufacturerData;
+            if (mfgData.containsKey(0x004C) || mfgData.containsKey(0x4C00)) {
+              final bytes = mfgData[0x004C] ?? mfgData[0x4C00];
+              if (bytes != null && bytes.length >= 20) {
+                final uuidBytes = bytes.sublist(2, 18);
+                final hexStr = uuidBytes
                     .map((b) => b.toRadixString(16).padLeft(2, '0'))
                     .join();
-                final parsed =
-                    '${hex.substring(0, 8)}-${hex.substring(8, 12)}-'
-                    '${hex.substring(12, 16)}-${hex.substring(16, 20)}-'
-                    '${hex.substring(20, 32)}';
-                if (parsed.toLowerCase() == targetUuid) {
+                if (hexStr == cleanTargetUUID) {
                   matched = true;
                 }
               }
             }
           }
 
-          // ── Method 3: Fallback device name ──
           if (!matched) {
             final name = result.advertisementData.advName;
-            if (name.isNotEmpty && name.contains('Classroom_302_Beacon')) {
+            if (name.isNotEmpty &&
+                (name.contains('Classroom_Beacon') || name.contains('SAS_Classroom_Beacon'))) {
               matched = true;
             }
           }
 
-          // Check RSSI proximity
           if (matched && result.rssi >= kMinRssi) {
             completer.complete(true);
           }
@@ -289,13 +324,12 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  App entry point
+//  App Entry Point
 // ─────────────────────────────────────────────────────────────────────────────
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Enumerate cameras
   try {
     _cameras = await availableCameras();
   } catch (e) {
@@ -303,19 +337,21 @@ Future<void> main() async {
     debugPrint('[CAMERA] Initialization error: $e');
   }
 
-  // Initialize Local Notifications & Background Service
   await initLocalNotifications();
   await initializeBackgroundService();
 
-  runApp(const AttendanceApp());
+  final bool alreadyRegistered = await AppSettings.isRegistered();
+
+  runApp(AttendanceApp(isRegistered: alreadyRegistered));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Root widget
+//  Root Widget
 // ─────────────────────────────────────────────────────────────────────────────
 
 class AttendanceApp extends StatelessWidget {
-  const AttendanceApp({super.key});
+  final bool isRegistered;
+  const AttendanceApp({super.key, required this.isRegistered});
 
   @override
   Widget build(BuildContext context) {
@@ -324,17 +360,432 @@ class AttendanceApp extends StatelessWidget {
       title: 'Smart Attendance',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorSchemeSeed: Colors.indigo,
+        colorSchemeSeed: const Color(0xFF0F3460),
         useMaterial3: true,
         brightness: Brightness.light,
+        scaffoldBackgroundColor: const Color(0xFFF4F6F9),
       ),
-      home: const AttendanceScreen(),
+      home: isRegistered
+          ? const AttendanceScreen()
+          : const StudentRegisterScreen(),
     );
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Main attendance screen
+//  1st-Time Student Registration Screen
+// ─────────────────────────────────────────────────────────────────────────────
+
+class StudentRegisterScreen extends StatefulWidget {
+  final bool isEditMode;
+  const StudentRegisterScreen({super.key, this.isEditMode = false});
+
+  @override
+  State<StudentRegisterScreen> createState() => _StudentRegisterScreenState();
+}
+
+class _StudentRegisterScreenState extends State<StudentRegisterScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _nameController = TextEditingController();
+  final _rollController = TextEditingController();
+  final _serverController = TextEditingController(text: kDefaultApiBaseUrl);
+
+  CameraController? _cameraController;
+  bool _isCameraReady = false;
+  XFile? _capturedFacePhoto;
+  bool _isRegistering = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadExistingProfile();
+    _initializeCamera();
+  }
+
+  Future<void> _loadExistingProfile() async {
+    final server = await AppSettings.getServerUrl();
+    _serverController.text = server;
+
+    if (widget.isEditMode) {
+      _nameController.text = await AppSettings.getStudentName();
+      _rollController.text = await AppSettings.getStudentRoll();
+    }
+  }
+
+  Future<void> _initializeCamera() async {
+    if (_cameras.isEmpty) {
+      try {
+        _cameras = await availableCameras();
+      } catch (e) {
+        debugPrint('[Camera] Init error: $e');
+        return;
+      }
+    }
+
+    CameraDescription? frontCamera;
+    for (final cam in _cameras) {
+      if (cam.lensDirection == CameraLensDirection.front) {
+        frontCamera = cam;
+        break;
+      }
+    }
+    frontCamera ??= _cameras.isNotEmpty ? _cameras.first : null;
+
+    if (frontCamera == null) return;
+
+    final controller = CameraController(
+      frontCamera,
+      ResolutionPreset.medium,
+      enableAudio: false,
+    );
+
+    try {
+      await controller.initialize();
+      if (!mounted) return;
+      setState(() {
+        _cameraController = controller;
+        _isCameraReady = true;
+      });
+    } catch (e) {
+      debugPrint('[Camera] Error: $e');
+    }
+  }
+
+  Future<void> _capturePhoto() async {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+      return;
+    }
+    try {
+      final photo = await _cameraController!.takePicture();
+      setState(() {
+        _capturedFacePhoto = photo;
+      });
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error capturing photo: $e')),
+      );
+    }
+  }
+
+  Future<void> _submitRegistration() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    if (_capturedFacePhoto == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please capture a face selfie photo first.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    setState(() => _isRegistering = true);
+
+    final name = _nameController.text.trim();
+    final rollNo = _rollController.text.trim().toUpperCase();
+    final serverUrl = _serverController.text.trim();
+
+    try {
+      final uri = Uri.parse('$serverUrl/register');
+      final request = http.MultipartRequest('POST', uri)
+        ..fields['name'] = name
+        ..fields['roll_no'] = rollNo
+        ..files.add(
+          await http.MultipartFile.fromPath(
+            'photo',
+            _capturedFacePhoto!.path,
+          ),
+        );
+
+      final streamed = await request.send().timeout(const Duration(seconds: 15));
+      final response = await http.Response.fromStream(streamed);
+
+      final Map<String, dynamic> data =
+          jsonDecode(response.body) as Map<String, dynamic>;
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        // Save locally in SharedPreferences
+        await AppSettings.saveProfile(
+          name: name,
+          rollNo: rollNo,
+          serverUrl: serverUrl,
+        );
+
+        if (!mounted) return;
+
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            icon: const Icon(Icons.check_circle, color: Colors.green, size: 50),
+            title: const Text('Registration Successful!'),
+            content: Text(
+              'Welcome $name!\n\nYour profile (Roll: $rollNo) and face encoding have been saved on the server.\n\nYou can now mark attendance anytime you are in class.',
+            ),
+            actions: [
+              FilledButton(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  Navigator.of(context).pushReplacement(
+                    MaterialPageRoute(
+                      builder: (context) => const AttendanceScreen(),
+                    ),
+                  );
+                },
+                child: const Text('Go to Dashboard'),
+              ),
+            ],
+          ),
+        );
+      } else {
+        final errorMsg = data['detail'] ?? 'Registration failed (${response.statusCode})';
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Server Error: $errorMsg'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } on SocketException {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Cannot connect to server at $serverUrl. Check IP / Wi-Fi.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _isRegistering = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _cameraController?.dispose();
+    _nameController.dispose();
+    _rollController.dispose();
+    _serverController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.isEditMode ? 'Edit Student Profile' : 'Student Registration'),
+        centerTitle: true,
+        backgroundColor: const Color(0xFF16213E),
+        foregroundColor: Colors.white,
+      ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Form(
+            key: _formKey,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Header Info
+                Card(
+                  elevation: 0,
+                  color: const Color(0xFF0F3460).withOpacity(0.08),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    side: const BorderSide(color: Color(0xFF0F3460), width: 0.5),
+                  ),
+                  child: const Padding(
+                    padding: EdgeInsets.all(14),
+                    child: Row(
+                      children: [
+                        Icon(Icons.info_outline, color: Color(0xFF0F3460)),
+                        SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            'Register your name, roll number, and face profile once. The app will save your details for attendance.',
+                            style: TextStyle(fontSize: 13, height: 1.3),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+
+                // Name input
+                TextFormField(
+                  controller: _nameController,
+                  decoration: InputDecoration(
+                    labelText: 'Full Name',
+                    hintText: 'e.g. Ayush Pandey',
+                    prefixIcon: const Icon(Icons.person),
+                    filled: true,
+                    fillColor: Colors.white,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                  validator: (v) =>
+                      v == null || v.trim().isEmpty ? 'Please enter your name' : null,
+                ),
+                const SizedBox(height: 14),
+
+                // Roll Number input
+                TextFormField(
+                  controller: _rollController,
+                  decoration: InputDecoration(
+                    labelText: 'Roll Number / Student ID',
+                    hintText: 'e.g. CS-2024-001',
+                    prefixIcon: const Icon(Icons.badge),
+                    filled: true,
+                    fillColor: Colors.white,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                  validator: (v) =>
+                      v == null || v.trim().isEmpty ? 'Please enter roll number' : null,
+                ),
+                const SizedBox(height: 14),
+
+                // Server URL input
+                TextFormField(
+                  controller: _serverController,
+                  decoration: InputDecoration(
+                    labelText: 'Server Base URL',
+                    hintText: 'http://<LAPTOP_IP>:8000',
+                    prefixIcon: const Icon(Icons.dns),
+                    helperText: 'Enter your laptop/server Wi-Fi IP and port 8000',
+                    filled: true,
+                    fillColor: Colors.white,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                  validator: (v) =>
+                      v == null || v.trim().isEmpty ? 'Please enter server URL' : null,
+                ),
+                const SizedBox(height: 20),
+
+                // Face Photo Capture Section
+                Text(
+                  'Face Photo Registration',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 8),
+
+                Container(
+                  height: 260,
+                  decoration: BoxDecoration(
+                    color: Colors.black,
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  clipBehavior: Clip.antiAlias,
+                  child: _capturedFacePhoto != null
+                      ? Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            Image.file(
+                              File(_capturedFacePhoto!.path),
+                              fit: BoxFit.cover,
+                            ),
+                            Positioned(
+                              bottom: 12,
+                              right: 12,
+                              child: FilledButton.tonalIcon(
+                                onPressed: () {
+                                  setState(() => _capturedFacePhoto = null);
+                                },
+                                icon: const Icon(Icons.refresh),
+                                label: const Text('Retake Photo'),
+                              ),
+                            ),
+                          ],
+                        )
+                      : _isCameraReady && _cameraController != null
+                          ? Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                CameraPreview(_cameraController!),
+                                Container(
+                                  width: 170,
+                                  height: 220,
+                                  decoration: BoxDecoration(
+                                    borderRadius: BorderRadius.circular(90),
+                                    border: Border.all(
+                                      color: Colors.white.withOpacity(0.8),
+                                      width: 2.5,
+                                    ),
+                                  ),
+                                ),
+                                Positioned(
+                                  bottom: 12,
+                                  child: FilledButton.icon(
+                                    onPressed: _capturePhoto,
+                                    icon: const Icon(Icons.camera_alt),
+                                    label: const Text('Capture Face'),
+                                  ),
+                                ),
+                              ],
+                            )
+                          : const Center(
+                              child: CircularProgressIndicator(color: Colors.white),
+                            ),
+                ),
+                const SizedBox(height: 24),
+
+                // Submit Button
+                SizedBox(
+                  height: 54,
+                  child: FilledButton.icon(
+                    onPressed: _isRegistering ? null : _submitRegistration,
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFFE94560),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    icon: _isRegistering
+                        ? const SizedBox(
+                            width: 22,
+                            height: 22,
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 2.5,
+                            ),
+                          )
+                        : const Icon(Icons.how_to_reg, size: 24),
+                    label: Text(
+                      _isRegistering ? 'Registering Face…' : 'Register Profile & Face',
+                      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Main Attendance Dashboard (For Registered Students)
 // ─────────────────────────────────────────────────────────────────────────────
 
 class AttendanceScreen extends StatefulWidget {
@@ -346,19 +797,34 @@ class AttendanceScreen extends StatefulWidget {
 
 class _AttendanceScreenState extends State<AttendanceScreen> {
   StreamSubscription<bool>? _notificationSub;
+  String _studentName = '';
+  String _studentRoll = '';
+  String _serverUrl = '';
 
   @override
   void initState() {
     super.initState();
-    // Request required permissions on app startup
+    _loadProfile();
     _requestAllPermissions();
 
-    // Listen for notification taps
     _notificationSub = _openFaceScanTrigger.stream.listen((shouldOpen) {
       if (shouldOpen && mounted) {
-        // Navigation handled globally via navigatorKey
+        // Navigation handled globally
       }
     });
+  }
+
+  Future<void> _loadProfile() async {
+    final name = await AppSettings.getStudentName();
+    final roll = await AppSettings.getStudentRoll();
+    final server = await AppSettings.getServerUrl();
+    if (mounted) {
+      setState(() {
+        _studentName = name;
+        _studentRoll = roll;
+        _serverUrl = server;
+      });
+    }
   }
 
   @override
@@ -379,6 +845,85 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
     ].request();
   }
 
+  void _showSettingsDialog() {
+    final controller = TextEditingController(text: _serverUrl);
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Server & Profile Settings'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Server Address:',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+            ),
+            const SizedBox(height: 6),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                hintText: 'http://192.168.1.15:8000',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            const SizedBox(height: 18),
+            const Divider(),
+            const SizedBox(height: 6),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.edit, color: Color(0xFF0F3460)),
+              title: const Text('Edit Student Profile'),
+              subtitle: const Text('Change name, roll number, or photo'),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (context) => const StudentRegisterScreen(isEditMode: true),
+                  ),
+                ).then((_) => _loadProfile());
+              },
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.logout, color: Colors.red),
+              title: const Text('Reset Profile / Switch User'),
+              onTap: () async {
+                await AppSettings.clearProfile();
+                if (!mounted) return;
+                Navigator.of(ctx).pop();
+                Navigator.of(context).pushReplacement(
+                  MaterialPageRoute(
+                    builder: (context) => const StudentRegisterScreen(),
+                  ),
+                );
+              },
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              final newUrl = controller.text.trim();
+              if (newUrl.isNotEmpty) {
+                await AppSettings.updateServerUrl(newUrl);
+                _loadProfile();
+              }
+              if (ctx.mounted) Navigator.of(ctx).pop();
+            },
+            child: const Text('Save Server URL'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -387,42 +932,169 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
       appBar: AppBar(
         title: const Text('Smart Attendance'),
         centerTitle: true,
+        backgroundColor: const Color(0xFF16213E),
+        foregroundColor: Colors.white,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Settings',
+            onPressed: _showSettingsDialog,
+          ),
+        ],
       ),
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
           child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const Spacer(),
-              Icon(
-                Icons.bluetooth_searching,
-                size: 96,
-                color: theme.colorScheme.primary,
+              // Student Profile Card
+              Card(
+                elevation: 2,
+                color: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Row(
+                    children: [
+                      CircleAvatar(
+                        radius: 28,
+                        backgroundColor: const Color(0xFF0F3460),
+                        child: Text(
+                          _studentName.isNotEmpty
+                              ? _studentName.substring(0, 1).toUpperCase()
+                              : '?',
+                          style: const TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              _studentName.isNotEmpty ? _studentName : 'Student Profile',
+                              style: theme.textTheme.titleMedium?.copyWith(
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              'Roll No: ${_studentRoll.isNotEmpty ? _studentRoll : "Not Registered"}',
+                              style: TextStyle(
+                                color: Colors.grey.shade700,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Colors.green.shade50,
+                                    borderRadius: BorderRadius.circular(6),
+                                    border: Border.all(color: Colors.green.shade300),
+                                  ),
+                                  child: const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.check_circle, size: 12, color: Colors.green),
+                                      SizedBox(width: 4),
+                                      Text(
+                                        'Enrolled on Server',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.green,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // BLE Beacon Scanning Card
+              Card(
+                elevation: 1,
+                color: const Color(0xFF16213E),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(Icons.bluetooth_searching, color: Color(0xFFE94560), size: 28),
+                          SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              'Background Classroom Beacon Scan',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 16,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        'When you enter the lecture hall, your phone will catch the classroom ESP32 beacon and send you a notification:\n\n'
+                        '“You are in the classroom. Tap to mark attendance.”',
+                        style: TextStyle(
+                          color: Colors.grey.shade300,
+                          fontSize: 13,
+                          height: 1.4,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Row(
+                        children: [
+                          Container(
+                            width: 8,
+                            height: 8,
+                            decoration: const BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.greenAccent,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          const Text(
+                            'Foreground service active & monitoring',
+                            style: TextStyle(color: Colors.greenAccent, fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
               ),
               const SizedBox(height: 24),
-              Text(
-                'Background Beacon Scanning Active',
-                style: theme.textTheme.titleLarge?.copyWith(
-                  fontWeight: FontWeight.bold,
-                ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 12),
-              Text(
-                'When you walk into the classroom, the app detects the ESP32 beacon and sends a notification:\n\n'
-                '“You are in the classroom. Tap to mark attendance.”\n\n'
-                'Tapping the notification opens the Face Scan Screen directly.',
-                textAlign: TextAlign.center,
-                style: theme.textTheme.bodyMedium?.copyWith(
-                  color: Colors.grey.shade700,
-                  height: 1.4,
-                ),
-              ),
-              const Spacer(flex: 2),
 
-              // Button to manually open Face Scan Screen
+              // Primary Action: Face Scan
               SizedBox(
-                width: double.infinity,
                 height: 56,
                 child: FilledButton.icon(
                   onPressed: () {
@@ -433,32 +1105,37 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
                       ),
                     );
                   },
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFFE94560),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
                   icon: const Icon(Icons.camera_alt, size: 26),
                   label: const Text(
-                    'Open Face Scan Screen',
-                    style: TextStyle(fontSize: 16),
+                    'Mark Attendance (Face Scan)',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                   ),
                 ),
               ),
               const SizedBox(height: 12),
 
-              // Simulation helper button for testing notification
+              // Simulation helper button
               OutlinedButton.icon(
                 onPressed: () async {
                   await showClassroomNotification();
                   if (context.mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
-                        content: Text('Test notification sent! Tap it to open Face Scan.'),
+                        content: Text('Simulated notification sent! Tap it to open Face Scan.'),
                         duration: Duration(seconds: 3),
                       ),
                     );
                   }
                 },
                 icon: const Icon(Icons.notifications_active),
-                label: const Text('Simulate Beacon Notification'),
+                label: const Text('Simulate Classroom Notification'),
               ),
-              const Spacer(),
             ],
           ),
         ),
@@ -468,7 +1145,7 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Face Scan Screen (opened directly on notification tap)
+//  Face Scan Screen (opened on notification tap or button)
 // ─────────────────────────────────────────────────────────────────────────────
 
 class FaceScanScreen extends StatefulWidget {
@@ -484,11 +1161,25 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
   bool _isProcessing = false;
   String _statusMessage = 'Align your face inside the frame and tap Capture.';
   Color _statusColor = Colors.black87;
+  String _serverUrl = kDefaultApiBaseUrl;
+  String _studentName = '';
 
   @override
   void initState() {
     super.initState();
+    _loadSettings();
     _initializeCamera();
+  }
+
+  Future<void> _loadSettings() async {
+    final server = await AppSettings.getServerUrl();
+    final name = await AppSettings.getStudentName();
+    if (mounted) {
+      setState(() {
+        _serverUrl = server;
+        _studentName = name;
+      });
+    }
   }
 
   Future<void> _initializeCamera() async {
@@ -559,7 +1250,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
 
       _setStatus('Checking time window & verifying face…', Colors.indigo);
 
-      final uri = Uri.parse('$kApiBaseUrl/verify');
+      final uri = Uri.parse('$_serverUrl/verify');
       final request = http.MultipartRequest('POST', uri)
         ..files.add(await http.MultipartFile.fromPath('photo', path));
 
@@ -575,15 +1266,15 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       if (response.statusCode == 200) {
         final name = data['name'] ?? '';
         final rollNo = data['roll_no'] ?? '';
-        final subject = data['subject'] ?? '';
+        final time = data['time'] ?? '';
         _setStatus(
-          '✅ Attendance Marked!\n\nName: $name\nRoll No: $rollNo\nSubject: $subject',
+          '✅ Attendance Marked Successfully!\n\nStudent: $name\nRoll No: $rollNo\nTime: $time',
           Colors.green.shade800,
         );
       } else if (response.statusCode == 403) {
-        // Strict Time Limit Exceeded error from FastAPI backend
+        // Strict 10-Minute Time Limit Exceeded error
         final detail = data['detail'] ?? 'Time limit exceeded.';
-        _setStatus('❌ Rejection:\n$detail', Colors.red.shade800);
+        _setStatus('❌ Rejection (Strict Window):\n$detail', Colors.red.shade800);
       } else {
         final detail = data['detail'] ?? 'Verification failed (${response.statusCode})';
         _setStatus('❌ $detail', Colors.red.shade800);
@@ -594,7 +1285,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       } catch (_) {}
     } on SocketException {
       _setStatus(
-        '❌ Connection error:\nCannot reach backend at $kApiBaseUrl',
+        '❌ Connection error:\nCannot reach backend at $_serverUrl',
         Colors.red.shade800,
       );
     } on TimeoutException {
@@ -622,13 +1313,30 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       appBar: AppBar(
         title: const Text('Face Scan Attendance'),
         centerTitle: true,
+        backgroundColor: const Color(0xFF16213E),
+        foregroundColor: Colors.white,
       ),
       body: SafeArea(
         child: Column(
           children: [
-            const SizedBox(height: 12),
+            if (_studentName.isNotEmpty)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+                color: const Color(0xFF0F3460).withOpacity(0.15),
+                child: Text(
+                  'Marking for: $_studentName',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF0F3460),
+                  ),
+                ),
+              ),
 
-            // Camera preview with face guide overlay
+            const SizedBox(height: 10),
+
+            // Camera Preview with Oval Frame
             Expanded(
               child: Container(
                 margin: const EdgeInsets.symmetric(horizontal: 20),
@@ -642,7 +1350,6 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                         alignment: Alignment.center,
                         children: [
                           CameraPreview(_cameraController!),
-                          // Face Oval Overlay
                           Container(
                             width: 240,
                             height: 320,
