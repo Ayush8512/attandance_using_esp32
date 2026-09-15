@@ -1,0 +1,9 @@
+﻿.git
+.gitignore
+mobile_app
+SmartAttendance.apk
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env

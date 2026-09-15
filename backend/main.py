@@ -51,7 +51,8 @@ logger = logging.getLogger("attendance")
 # Configuration
 # ---------------------------------------------------------------------------
 
-DATABASE_PATH = "attendance.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE_PATH = os.path.join(BASE_DIR, "attendance.db")
 FACE_MATCH_TOLERANCE = 0.6  # lower = stricter matching
 
 # ---------------------------------------------------------------------------
