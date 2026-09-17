@@ -1610,6 +1610,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
   Color _statusColor = Colors.black87;
   String _serverUrl = kDefaultApiBaseUrl;
   String _studentName = '';
+  String _studentRoll = '';
 
   @override
   void initState() {
@@ -1621,10 +1622,12 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
   Future<void> _loadSettings() async {
     final server = await AppSettings.getServerUrl();
     final name = await AppSettings.getStudentName();
+    final roll = await AppSettings.getStudentRoll();
     if (mounted) {
       setState(() {
         _serverUrl = server;
         _studentName = name;
+        _studentRoll = roll;
       });
     }
   }
@@ -1785,7 +1788,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                 padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
                 color: const Color(0xFF0F3460).withOpacity(0.15),
                 child: Text(
-                  'Marking for: $_studentName',
+                  'Marking for: $_studentName (${_studentRoll.isNotEmpty ? _studentRoll : ""})',
                   textAlign: TextAlign.center,
                   style: const TextStyle(
                     fontWeight: FontWeight.bold,
