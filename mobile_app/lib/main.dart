@@ -942,9 +942,25 @@ class AttendanceScreen extends StatefulWidget {
 
 class _AttendanceScreenState extends State<AttendanceScreen> {
   StreamSubscription<bool>? _notificationSub;
+  Timer? _autoRefreshTimer;
+
   String _studentName = '';
   String _studentRoll = '';
   String _serverUrl = '';
+
+  // Timetable State
+  bool _isLoadingTimetable = false;
+  Map<String, dynamic>? _currentClass;
+  Map<String, dynamic>? _windowStatus;
+  String _serverDay = '';
+  String _serverTime = '';
+
+  // BLE Beacon State
+  bool _isManualScanning = false;
+  bool _isBeaconDetected = false;
+  int? _beaconRssi;
+  String _beaconName = '';
+  String _bleStatusMessage = 'Waiting for classroom beacon scan...';
 
   @override
   void initState() {
@@ -954,7 +970,14 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
 
     _notificationSub = _openFaceScanTrigger.stream.listen((shouldOpen) {
       if (shouldOpen && mounted) {
-        // Navigation handled globally
+        // Handled globally
+      }
+    });
+
+    // Auto-refresh timetable and beacon every 15 seconds
+    _autoRefreshTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (mounted && !_isManualScanning) {
+        _fetchLiveTimetable();
       }
     });
   }
@@ -969,11 +992,14 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
         _studentRoll = roll;
         _serverUrl = server;
       });
+      _fetchLiveTimetable();
+      _startManualBeaconScan();
     }
   }
 
   @override
   void dispose() {
+    _autoRefreshTimer?.cancel();
     _notificationSub?.cancel();
     super.dispose();
   }
@@ -988,6 +1014,134 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
       Permission.camera,
       Permission.notification,
     ].request();
+  }
+
+  Future<void> _fetchLiveTimetable() async {
+    if (_serverUrl.isEmpty) return;
+    setState(() => _isLoadingTimetable = true);
+    try {
+      final uri = Uri.parse('$_serverUrl/timetable');
+      final response = await http.get(uri).timeout(const Duration(seconds: 8));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final currentSlot = data['current_slot'] as Map<String, dynamic>?;
+        if (currentSlot != null && mounted) {
+          setState(() {
+            _serverDay = currentSlot['day'] ?? '';
+            _serverTime = currentSlot['time'] ?? '';
+            _currentClass = currentSlot['class'] as Map<String, dynamic>?;
+            _windowStatus = currentSlot['window_status'] as Map<String, dynamic>?;
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint('[TIMETABLE] Failed to fetch: $e');
+    } finally {
+      if (mounted) setState(() => _isLoadingTimetable = false);
+    }
+  }
+
+  Future<void> _startManualBeaconScan() async {
+    if (_isManualScanning) return;
+    setState(() {
+      _isManualScanning = true;
+      _bleStatusMessage = 'Scanning for ESP32 Classroom Beacon...';
+    });
+
+    final cleanTargetUUID = kBeaconUUID.replaceAll('-', '').toLowerCase();
+    bool found = false;
+    int? bestRssi;
+    String detectedName = '';
+
+    StreamSubscription? scanSub;
+    try {
+      // Check Bluetooth Adapter
+      if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
+        setState(() {
+          _isBeaconDetected = false;
+          _bleStatusMessage = 'Please turn ON Bluetooth on your phone.';
+          _isManualScanning = false;
+        });
+        return;
+      }
+
+      scanSub = FlutterBluePlus.scanResults.listen((results) {
+        for (final r in results) {
+          bool matched = false;
+
+          // 1. Service UUID match
+          for (final u in r.advertisementData.serviceUuids) {
+            final clean = u.toString().replaceAll('-', '').toLowerCase();
+            if (clean == cleanTargetUUID) {
+              matched = true;
+              break;
+            }
+          }
+
+          // 2. iBeacon Manufacturer match
+          if (!matched) {
+            final mfg = r.advertisementData.manufacturerData;
+            if (mfg.containsKey(0x004C) || mfg.containsKey(0x4C00)) {
+              final bytes = mfg[0x004C] ?? mfg[0x4C00];
+              if (bytes != null && bytes.length >= 20) {
+                final uuidBytes = bytes.sublist(2, 18);
+                final hexStr = uuidBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+                if (hexStr == cleanTargetUUID) {
+                  matched = true;
+                }
+              }
+            }
+          }
+
+          // 3. Name match
+          if (!matched) {
+            final name = r.advertisementData.advName;
+            final devName = r.device.platformName;
+            if (name.contains('Classroom_Beacon') ||
+                name.contains('SAS_Classroom_Beacon') ||
+                devName.contains('Classroom_Beacon') ||
+                devName.contains('SAS_Classroom_Beacon')) {
+              matched = true;
+            }
+          }
+
+          if (matched) {
+            found = true;
+            bestRssi = r.rssi;
+            detectedName = r.advertisementData.advName.isNotEmpty
+                ? r.advertisementData.advName
+                : (r.device.platformName.isNotEmpty ? r.device.platformName : 'SAS_Classroom_Beacon');
+            break;
+          }
+        }
+      });
+
+      await FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 6),
+        androidUsesFineLocation: true,
+      );
+
+      await Future.delayed(const Duration(seconds: 6));
+    } catch (e) {
+      debugPrint('[BLE_SCAN] Error: $e');
+      setState(() => _bleStatusMessage = 'Scan error: $e');
+    } finally {
+      await FlutterBluePlus.stopScan();
+      await scanSub?.cancel();
+      if (mounted) {
+        setState(() {
+          _isManualScanning = false;
+          _isBeaconDetected = found;
+          _beaconRssi = bestRssi;
+          _beaconName = detectedName;
+          if (found) {
+            _bleStatusMessage = 'ESP32 Beacon detected! Signal: ${bestRssi ?? 0} dBm';
+          } else {
+            _bleStatusMessage = 'Beacon not detected. Ensure ESP32 is ON & Location is active.';
+          }
+        });
+      }
+    }
   }
 
   void _showSettingsDialog() {
@@ -1009,7 +1163,7 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
             TextField(
               controller: controller,
               decoration: const InputDecoration(
-                hintText: 'http://192.168.1.15:8000',
+                hintText: 'http://10.127.162.188:8000',
                 border: OutlineInputBorder(),
                 isDense: true,
               ),
@@ -1072,6 +1226,11 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final hasActiveSubject = _currentClass != null && _currentClass!['subject'] != null;
+    final subjectName = hasActiveSubject ? _currentClass!['subject'] : 'No Class Scheduled';
+    final teacherEmail = hasActiveSubject ? _currentClass!['teacher_email'] ?? '' : '';
+    final isWindowOpen = _windowStatus != null && _windowStatus!['is_open'] == true;
+    final windowMessage = _windowStatus != null ? _windowStatus!['message'] ?? '' : '';
 
     return Scaffold(
       appBar: AppBar(
@@ -1081,6 +1240,14 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
         foregroundColor: Colors.white,
         actions: [
           IconButton(
+            icon: const Icon(Icons.refresh),
+            tooltip: 'Refresh Status',
+            onPressed: () {
+              _fetchLiveTimetable();
+              _startManualBeaconScan();
+            },
+          ),
+          IconButton(
             icon: const Icon(Icons.settings),
             tooltip: 'Settings',
             onPressed: _showSettingsDialog,
@@ -1088,200 +1255,335 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
         ],
       ),
       body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // Student Profile Card
-              Card(
-                elevation: 2,
-                color: Colors.white,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Row(
-                    children: [
-                      CircleAvatar(
-                        radius: 28,
-                        backgroundColor: const Color(0xFF0F3460),
-                        child: Text(
-                          _studentName.isNotEmpty
-                              ? _studentName.substring(0, 1).toUpperCase()
-                              : '?',
-                          style: const TextStyle(
-                            fontSize: 22,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.white,
+        child: RefreshIndicator(
+          onRefresh: () async {
+            await _fetchLiveTimetable();
+            await _startManualBeaconScan();
+          },
+          child: SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // 1. Student Profile Header Card
+                Card(
+                  elevation: 2,
+                  color: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      children: [
+                        CircleAvatar(
+                          radius: 26,
+                          backgroundColor: const Color(0xFF0F3460),
+                          child: Text(
+                            _studentName.isNotEmpty
+                                ? _studentName.substring(0, 1).toUpperCase()
+                                : '?',
+                            style: const TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                _studentName.isNotEmpty ? _studentName : 'Student Profile',
+                                style: theme.textTheme.titleMedium?.copyWith(
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                'Roll No: ${_studentRoll.isNotEmpty ? _studentRoll : "Not Registered"}',
+                                style: TextStyle(
+                                  color: Colors.grey.shade700,
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 13,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: Colors.green.shade50,
+                                  borderRadius: BorderRadius.circular(6),
+                                  border: Border.all(color: Colors.green.shade300),
+                                ),
+                                child: const Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(Icons.verified, size: 12, color: Colors.green),
+                                    SizedBox(width: 4),
+                                    Text(
+                                      'Biometrics Locked & Secure',
+                                      style: TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.green,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+
+                // 2. Live Timetable & Active Class Card
+                Card(
+                  elevation: 2,
+                  color: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                    side: BorderSide(
+                      color: isWindowOpen ? Colors.green.shade400 : Colors.grey.shade300,
+                      width: isWindowOpen ? 2 : 1,
+                    ),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.between,
                           children: [
-                            Text(
-                              _studentName.isNotEmpty ? _studentName : 'Student Profile',
-                              style: theme.textTheme.titleMedium?.copyWith(
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              'Roll No: ${_studentRoll.isNotEmpty ? _studentRoll : "Not Registered"}',
-                              style: TextStyle(
-                                color: Colors.grey.shade700,
-                                fontWeight: FontWeight.w500,
-                              ),
-                            ),
-                            const SizedBox(height: 6),
                             Row(
                               children: [
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 8,
-                                    vertical: 2,
+                                Icon(Icons.school, color: isWindowOpen ? Colors.green : const Color(0xFF0F3460), size: 22),
+                                const SizedBox(width: 8),
+                                const Text(
+                                  'Current Scheduled Class',
+                                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                                ),
+                              ],
+                            ),
+                            if (_isLoadingTimetable)
+                              const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            else if (_serverDay.isNotEmpty)
+                              Text(
+                                '$_serverDay ${_serverTime.length >= 5 ? _serverTime.substring(0, 5) : ""}',
+                                style: TextStyle(color: Colors.grey.shade600, fontSize: 12, fontWeight: FontWeight.bold),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          subjectName,
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            color: hasActiveSubject ? Colors.black87 : Colors.grey.shade600,
+                          ),
+                        ),
+                        if (teacherEmail.isNotEmpty) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            'Teacher: $teacherEmail',
+                            style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+                          ),
+                        ],
+                        const SizedBox(height: 12),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: isWindowOpen ? Colors.green.shade50 : (hasActiveSubject ? Colors.red.shade50 : Colors.grey.shade100),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: isWindowOpen ? Colors.green.shade300 : (hasActiveSubject ? Colors.red.shade300 : Colors.grey.shade300),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                isWindowOpen ? Icons.check_circle : (hasActiveSubject ? Icons.access_time_filled : Icons.info),
+                                color: isWindowOpen ? Colors.green : (hasActiveSubject ? Colors.red : Colors.grey.shade700),
+                                size: 18,
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  isWindowOpen
+                                      ? 'Window OPEN — You can mark attendance now!'
+                                      : (windowMessage.isNotEmpty ? windowMessage : 'No active attendance window.'),
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: isWindowOpen ? Colors.green.shade800 : (hasActiveSubject ? Colors.red.shade800 : Colors.grey.shade700),
                                   ),
-                                  decoration: BoxDecoration(
-                                    color: Colors.green.shade50,
-                                    borderRadius: BorderRadius.circular(6),
-                                    border: Border.all(color: Colors.green.shade300),
-                                  ),
-                                  child: const Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Icon(Icons.check_circle, size: 12, color: Colors.green),
-                                      SizedBox(width: 4),
-                                      Text(
-                                        'Enrolled on Server',
-                                        style: TextStyle(
-                                          fontSize: 11,
-                                          fontWeight: FontWeight.bold,
-                                          color: Colors.green,
-                                        ),
-                                      ),
-                                    ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+
+                // 3. ESP32 Classroom Beacon Live Radar Card
+                Card(
+                  elevation: 2,
+                  color: const Color(0xFF16213E),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.between,
+                          children: [
+                            const Row(
+                              children: [
+                                Icon(Icons.bluetooth_searching, color: Color(0xFFE94560), size: 24),
+                                SizedBox(width: 8),
+                                Text(
+                                  'ESP32 Classroom Beacon',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 15,
                                   ),
                                 ),
                               ],
                             ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 16),
-
-              // BLE Beacon Scanning Card
-              Card(
-                elevation: 1,
-                color: const Color(0xFF16213E),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    children: [
-                      const Row(
-                        children: [
-                          Icon(Icons.bluetooth_searching, color: Color(0xFFE94560), size: 28),
-                          SizedBox(width: 12),
-                          Expanded(
-                            child: Text(
-                              'Background Classroom Beacon Scan',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 16,
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                              decoration: BoxDecoration(
+                                color: _isBeaconDetected ? Colors.green.withOpacity(0.2) : Colors.red.withOpacity(0.2),
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(
+                                  color: _isBeaconDetected ? Colors.greenAccent : Colors.redAccent,
+                                ),
+                              ),
+                              child: Text(
+                                _isBeaconDetected ? 'IN CLASS' : 'NOT DETECTED',
+                                style: TextStyle(
+                                  color: _isBeaconDetected ? Colors.greenAccent : Colors.redAccent,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                ),
                               ),
                             ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      Text(
-                        'When you enter the lecture hall, your phone will catch the classroom ESP32 beacon and send you a notification:\n\n'
-                        '“You are in the classroom. Tap to mark attendance.”',
-                        style: TextStyle(
-                          color: Colors.grey.shade300,
-                          fontSize: 13,
-                          height: 1.4,
+                          ],
                         ),
-                      ),
-                      const SizedBox(height: 14),
-                      Row(
-                        children: [
-                          Container(
-                            width: 8,
-                            height: 8,
-                            decoration: const BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: Colors.greenAccent,
-                            ),
+                        const SizedBox(height: 10),
+                        Text(
+                          _bleStatusMessage,
+                          style: TextStyle(
+                            color: Colors.grey.shade300,
+                            fontSize: 12,
                           ),
-                          const SizedBox(width: 8),
-                          const Text(
-                            'Foreground service active & monitoring',
-                            style: TextStyle(color: Colors.greenAccent, fontSize: 12),
+                        ),
+                        if (_isBeaconDetected && _beaconRssi != null) ...[
+                          const SizedBox(height: 6),
+                          Row(
+                            children: [
+                              const Icon(Icons.signal_cellular_alt, color: Colors.greenAccent, size: 16),
+                              const SizedBox(width: 6),
+                              Text(
+                                'RSSI: $_beaconRssi dBm  •  $_beaconName',
+                                style: const TextStyle(color: Colors.greenAccent, fontSize: 12, fontWeight: FontWeight.bold),
+                              ),
+                            ],
                           ),
                         ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 24),
-
-              // Primary Action: Face Scan
-              SizedBox(
-                height: 56,
-                child: FilledButton.icon(
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => const FaceScanScreen(),
-                      ),
-                    );
-                  },
-                  style: FilledButton.styleFrom(
-                    backgroundColor: const Color(0xFFE94560),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: OutlinedButton.icon(
+                                onPressed: _isManualScanning ? null : _startManualBeaconScan,
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: Colors.white,
+                                  side: const BorderSide(color: Colors.white54),
+                                ),
+                                icon: _isManualScanning
+                                    ? const SizedBox(
+                                        width: 14,
+                                        height: 14,
+                                        child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                                      )
+                                    : const Icon(Icons.radar, size: 18),
+                                label: Text(_isManualScanning ? 'Scanning...' : 'Scan for ESP32 Beacon'),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
                     ),
                   ),
-                  icon: const Icon(Icons.camera_alt, size: 26),
-                  label: const Text(
-                    'Mark Attendance (Face Scan)',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 20),
+
+                // 4. Primary Action: Face Scan Button
+                SizedBox(
+                  height: 54,
+                  child: FilledButton.icon(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => const FaceScanScreen(),
+                        ),
+                      );
+                    },
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFFE94560),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    icon: const Icon(Icons.camera_alt, size: 24),
+                    label: const Text(
+                      'Mark Attendance (Face Scan)',
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(height: 12),
+                const SizedBox(height: 12),
 
-              // Simulation helper button
-              OutlinedButton.icon(
-                onPressed: () async {
-                  await showClassroomNotification();
-                  if (context.mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('Simulated notification sent! Tap it to open Face Scan.'),
-                        duration: Duration(seconds: 3),
-                      ),
-                    );
-                  }
-                },
-                icon: const Icon(Icons.notifications_active),
-                label: const Text('Simulate Classroom Notification'),
-              ),
-            ],
+                // Simulation helper button
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    await showClassroomNotification();
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Simulated classroom notification triggered! Tap it to open Face Scan.'),
+                          duration: Duration(seconds: 3),
+                        ),
+                      );
+                    }
+                  },
+                  icon: const Icon(Icons.notifications_active, size: 18),
+                  label: const Text('Simulate Classroom Entry Notification', style: TextStyle(fontSize: 12)),
+                ),
+              ],
+            ),
           ),
         ),
       ),
