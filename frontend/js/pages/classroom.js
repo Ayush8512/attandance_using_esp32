@@ -1,4 +1,5 @@
 import { api } from '../api.js';
+import { showToast } from '../components/toast.js';
 
 export default {
     async render(container) {
@@ -99,11 +100,38 @@ export default {
                                     Teacher: <span class="text-white">${slot.class.teacher_email}</span> | Server Time: <span class="font-mono text-highlight">${slot.time}</span>
                                 </p>
                             </div>
-                            <span class="text-xs text-gray-400 font-mono bg-darkbg px-3 py-1.5 rounded-lg border border-gray-700">
-                                10-Min Allowed Window
-                            </span>
+                            <div class="flex items-center gap-3">
+                                <button id="btn-live-end-class" class="bg-highlight hover:bg-red-600 text-white px-4 py-2 rounded-lg text-xs font-semibold flex items-center gap-2 transition-colors shadow">
+                                    <i class="fas fa-file-excel"></i> End Class & Send Sheet
+                                </button>
+                                <span class="text-xs text-gray-400 font-mono bg-darkbg px-3 py-2 rounded-lg border border-gray-700">
+                                    10-Min Allowed Window
+                                </span>
+                            </div>
                         </div>
                     `;
+
+                    document.getElementById('btn-live-end-class')?.addEventListener('click', async () => {
+                        const btn = document.getElementById('btn-live-end-class');
+                        const origText = btn.innerHTML;
+                        if (!confirm(`End class for '${slot.class.subject}' and email the attendance Excel sheet to ${slot.class.teacher_email}?`)) {
+                            return;
+                        }
+                        try {
+                            btn.disabled = true;
+                            btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Sending...';
+                            const fd = new FormData();
+                            fd.append('subject', slot.class.subject);
+                            fd.append('teacher_email', slot.class.teacher_email);
+                            const res = await api.endClass(fd);
+                            showToast(res.message, "success");
+                        } catch (err) {
+                            showToast(`Failed: ${err.message}`, "error");
+                        } finally {
+                            btn.disabled = false;
+                            btn.innerHTML = origText;
+                        }
+                    });
                 } else {
                     banner.innerHTML = `
                         <div class="flex items-center justify-between text-gray-400">

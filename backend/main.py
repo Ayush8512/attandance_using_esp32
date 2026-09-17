@@ -189,12 +189,8 @@ async def generate_attendance_excel(
     subject: str,
 ) -> str:
     """
-    Query today's attendance, join with the students table, and write an
-    Excel workbook to a temporary file.  Returns the absolute path to the
-    generated ``.xlsx`` file.
-
-    The sheet includes columns: Roll No, Name, Status.
-    Students who verified get "Present"; all others are marked "Absent".
+    Query today's attendance for the specified subject, join with the students table,
+    and write a formatted Excel workbook with summary statistics.
     """
     db = await get_db()
     try:
@@ -204,24 +200,28 @@ async def generate_attendance_excel(
         )
         all_students = await cur_students.fetchall()
 
-        # Students marked present today
+        # Students marked present in THIS subject on target_date
         cur_present = await db.execute(
-            "SELECT DISTINCT roll_no FROM attendance WHERE date = ?",
-            (target_date,),
+            "SELECT DISTINCT a.roll_no, a.time FROM attendance a WHERE a.date = ? AND (a.subject = ? OR a.subject LIKE ?)",
+            (target_date, subject, f"%{subject}%"),
         )
         present_rows = await cur_present.fetchall()
     finally:
         await db.close()
 
-    present_roll_nos = {row["roll_no"] for row in present_rows}
+    present_map = {row["roll_no"]: row["time"] for row in present_rows}
 
     records = []
     for s in all_students:
+        is_pres = s["roll_no"] in present_map
         records.append(
             {
                 "Roll No": s["roll_no"],
-                "Name": s["name"],
-                "Status": "Present" if s["roll_no"] in present_roll_nos else "Absent",
+                "Student Name": s["name"],
+                "Subject": subject,
+                "Date": target_date,
+                "Scan Time": present_map.get(s["roll_no"], "-"),
+                "Attendance Status": "Present" if is_pres else "Absent",
             }
         )
 
@@ -229,11 +229,12 @@ async def generate_attendance_excel(
 
     # Write to a temp .xlsx file
     tmp_dir = tempfile.mkdtemp()
-    filename = f"Attendance_{subject.replace(' ', '_')}_{target_date}.xlsx"
+    clean_sub = "".join(c for c in subject if c.isalnum() or c in (" ", "_", "-")).strip()
+    filename = f"Attendance_{clean_sub.replace(' ', '_')}_{target_date}.xlsx"
     filepath = os.path.join(tmp_dir, filename)
 
     with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Attendance")
+        df.to_excel(writer, index=False, sheet_name=f"{clean_sub[:28]}")
 
     logger.info("Excel report generated → %s", filepath)
     return filepath
@@ -679,9 +680,10 @@ async def verify_attendance(
 async def get_attendance(
     roll_no: str | None = None,
     date_filter: str | None = None,
+    subject_filter: str | None = None,
 ):
     """
-    Retrieve attendance records, optionally filtered by `roll_no` and/or `date_filter` (YYYY-MM-DD).
+    Retrieve attendance records, optionally filtered by `roll_no`, `date_filter` (YYYY-MM-DD), and/or `subject_filter`.
     """
     db = await get_db()
     try:
@@ -694,6 +696,9 @@ async def get_attendance(
         if date_filter:
             query += " AND a.date = ?"
             params.append(date_filter)
+        if subject_filter:
+            query += " AND (a.subject = ? OR a.subject LIKE ?)"
+            params.extend([subject_filter, f"%{subject_filter}%"])
 
         query += " ORDER BY a.date DESC, a.time DESC"
 
@@ -868,17 +873,16 @@ async def end_class(
     today = date.today().isoformat()
 
     # --- Resolve class info from timetable or form overrides ---
-    class_info = get_class_info(now)
+    class_info = await get_class_info_from_db(now)
 
-    resolved_subject = subject or (class_info["subject"] if class_info else None)
-    resolved_email = teacher_email or (class_info["teacher_email"] if class_info else None)
+    resolved_subject = (subject and subject.strip()) or (class_info["subject"] if class_info else None)
+    resolved_email = (teacher_email and teacher_email.strip()) or (class_info["teacher_email"] if class_info else None)
 
     if not resolved_subject or not resolved_email:
         raise HTTPException(
             status_code=400,
             detail=(
-                "No class is scheduled for the current time slot "
-                f"({now.strftime('%A %H:%M')}). "
+                "Could not automatically resolve class. "
                 "Please provide 'subject' and 'teacher_email' manually."
             ),
         )

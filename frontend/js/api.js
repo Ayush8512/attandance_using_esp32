@@ -49,10 +49,11 @@ export const api = {
     }),
 
     // Attendance Records
-    getAttendance: (rollNo = '', date = '') => {
+    getAttendance: (rollNo = '', date = '', subject = '') => {
         let query = [];
         if (rollNo) query.push(`roll_no=${encodeURIComponent(rollNo)}`);
         if (date) query.push(`date_filter=${encodeURIComponent(date)}`);
+        if (subject) query.push(`subject_filter=${encodeURIComponent(subject)}`);
         const qs = query.length ? `?${query.join('&')}` : '';
         return fetchWithHandler(`/attendance${qs}`);
     },
