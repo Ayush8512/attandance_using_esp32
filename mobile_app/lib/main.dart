@@ -394,6 +394,7 @@ class _StudentRegisterScreenState extends State<StudentRegisterScreen> {
   bool _isCameraReady = false;
   XFile? _capturedFacePhoto;
   bool _isRegistering = false;
+  bool _isRestoring = false;
 
   @override
   void initState() {
@@ -579,6 +580,106 @@ class _StudentRegisterScreenState extends State<StudentRegisterScreen> {
     }
   }
 
+  Future<void> _restoreExistingProfile() async {
+    final rollNo = _rollController.text.trim().toUpperCase();
+    final serverUrl = _serverController.text.trim();
+
+    if (rollNo.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please enter your Roll Number first to restore profile.'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+    if (serverUrl.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please enter Server Base URL.'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
+    setState(() => _isRestoring = true);
+    try {
+      final uri = Uri.parse('$serverUrl/students/$rollNo');
+      final response = await http.get(uri).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final studentName = data['name'] ?? 'Student';
+        final studentRoll = data['roll_no'] ?? rollNo;
+
+        await AppSettings.saveProfile(
+          name: studentName,
+          rollNo: studentRoll,
+          serverUrl: serverUrl,
+        );
+
+        if (!mounted) return;
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            icon: const Icon(Icons.verified_user, color: Colors.green, size: 50),
+            title: const Text('Profile Restored!'),
+            content: Text(
+              'Welcome back, $studentName!\n\nYour profile (Roll: $studentRoll) is active on the server. You can now mark attendance.',
+            ),
+            actions: [
+              FilledButton(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  Navigator.of(context).pushReplacement(
+                    MaterialPageRoute(
+                      builder: (context) => const AttendanceScreen(),
+                    ),
+                  );
+                },
+                child: const Text('Go to Dashboard'),
+              ),
+            ],
+          ),
+        );
+      } else {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Roll No "$rollNo" is not registered yet. Please enter your name, take a selfie, and tap "Register Student" below.'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+    } on SocketException {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Cannot connect to server at $serverUrl.\nCheck Wi-Fi / IP connection.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } on TimeoutException {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Connection timed out to $serverUrl.\nCheck if backend server is running.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+      );
+    } finally {
+      if (mounted) setState(() => _isRestoring = false);
+    }
+  }
+
   @override
   void dispose() {
     _cameraController?.dispose();
@@ -686,6 +787,39 @@ class _StudentRegisterScreenState extends State<StudentRegisterScreen> {
                   ),
                   validator: (v) =>
                       v == null || v.trim().isEmpty ? 'Please enter server URL' : null,
+                ),
+                const SizedBox(height: 12),
+
+                // Restore Profile action for re-installed app
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F3460).withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: const Color(0xFF0F3460).withOpacity(0.2)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.history, color: Color(0xFF0F3460), size: 20),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text(
+                          'App reinstalled? Restore with Roll No:',
+                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                      FilledButton.tonal(
+                        onPressed: _isRestoring ? null : _restoreExistingProfile,
+                        child: _isRestoring
+                            ? const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Text('Restore Profile', style: TextStyle(fontSize: 12)),
+                      ),
+                    ],
+                  ),
                 ),
                 const SizedBox(height: 20),
 
@@ -1275,17 +1409,27 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       debugPrint('[VERIFY API] Status ${response.statusCode}: ${response.body}');
 
       if (response.statusCode == 200) {
+        final status = data['status'] ?? '';
         final name = data['name'] ?? '';
         final rollNo = data['roll_no'] ?? '';
         final time = data['time'] ?? '';
-        _setStatus(
-          '✅ Attendance Marked Successfully!\n\nStudent: $name\nRoll No: $rollNo\nTime: $time',
-          Colors.green.shade800,
-        );
+        if (status == 'already_marked') {
+          _setStatus(
+            'ℹ️ Already Marked Today!\n\nStudent: $name\nRoll No: $rollNo',
+            Colors.indigo.shade800,
+          );
+        } else {
+          _setStatus(
+            '✅ Attendance Marked Successfully!\n\nStudent: $name\nRoll No: $rollNo\nTime: $time',
+            Colors.green.shade800,
+          );
+        }
       } else if (response.statusCode == 403) {
-        // Strict 10-Minute Time Limit Exceeded error
         final detail = data['detail'] ?? 'Time limit exceeded.';
-        _setStatus('❌ Rejection (Strict Window):\n$detail', Colors.red.shade800);
+        _setStatus('⏰ Rejection (Strict Window):\n$detail', Colors.red.shade800);
+      } else if (response.statusCode == 404) {
+        final detail = data['detail'] ?? 'Face not recognized.';
+        _setStatus('🚫 Face Not Matched:\n$detail', Colors.red.shade800);
       } else {
         final detail = data['detail'] ?? 'Verification failed (${response.statusCode})';
         _setStatus('❌ $detail', Colors.red.shade800);

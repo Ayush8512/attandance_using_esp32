@@ -133,28 +133,30 @@ class TestStrictTimeWindow(unittest.TestCase):
         img_bytes.seek(0)
 
         # 1. Register student
-        reg_resp = self.client.post(
-            "/register",
-            data={"roll_no": "ROLL_TEST_101", "name": "Time Test Student"},
-            files={"photo": ("test.jpg", img_bytes.getvalue(), "image/jpeg")},
-        )
-        self.assertIn(reg_resp.status_code, [200, 409])  # 200 registered or 409 already exists
-
-        # 2. Verify during allowed window (10:05 AM Monday) -> Should succeed!
-        mock_now_valid = datetime(2026, 9, 14, 10, 5, 0)
-        with patch("main.datetime") as mock_datetime:
-            mock_datetime.now.return_value = mock_now_valid
-            mock_datetime.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
-
-            response = self.client.post(
-                "/verify",
+        dummy_encoding = [0.1] * 128
+        with patch("main.extract_face_encoding", return_value=dummy_encoding):
+            reg_resp = self.client.post(
+                "/register",
+                data={"roll_no": "ROLL_TEST_101", "name": "Time Test Student"},
                 files={"photo": ("test.jpg", img_bytes.getvalue(), "image/jpeg")},
             )
+            self.assertEqual(reg_resp.status_code, 200)
 
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
-            self.assertIn(data["status"], ["success", "already_marked"])
-            print(f"\n[TEST OK] Verified within window: status={data['status']}, roll_no={data['roll_no']}")
+            # 2. Verify during allowed window (10:05 AM Monday) -> Should succeed!
+            mock_now_valid = datetime(2026, 9, 14, 10, 5, 0)
+            with patch("main.datetime") as mock_datetime:
+                mock_datetime.now.return_value = mock_now_valid
+                mock_datetime.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+
+                response = self.client.post(
+                    "/verify",
+                    files={"photo": ("test.jpg", img_bytes.getvalue(), "image/jpeg")},
+                )
+
+                self.assertEqual(response.status_code, 200)
+                data = response.json()
+                self.assertIn(data["status"], ["success", "already_marked"])
+                print(f"\n[TEST OK] Verified within window: status={data['status']}, roll_no={data['roll_no']}")
 
         # 3. Verify late after 10-minute window (10:15 AM Monday) -> Should be rejected with 403 "Time limit exceeded"
         mock_now_late = datetime(2026, 9, 14, 10, 15, 0)

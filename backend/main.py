@@ -53,7 +53,7 @@ logger = logging.getLogger("attendance")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE_PATH = os.path.join(BASE_DIR, "attendance.db")
-FACE_MATCH_TOLERANCE = 0.6  # lower = stricter matching
+FACE_MATCH_TOLERANCE = 0.50  # 0.50 = strict matching, prevents false approvals
 
 # ---------------------------------------------------------------------------
 # SMTP / Email configuration  (override via environment variables)
@@ -358,20 +358,17 @@ async def extract_face_encoding(file: UploadFile) -> List[float]:
     contents = await file.read()
     if USE_REAL_FR:
         image = face_recognition.load_image_file(io.BytesIO(contents))
-        encodings = face_recognition.face_encodings(image)
+        face_locations = face_recognition.face_locations(image, model="hog")
+        if not face_locations:
+            raise ValueError("No face detected in photo. Please ensure your face is well-lit, upright, and clearly visible.")
+        if len(face_locations) > 1:
+            raise ValueError("Multiple faces detected in photo. Please ensure only one person is in the frame.")
+        encodings = face_recognition.face_encodings(image, known_face_locations=face_locations, num_jitters=1)
         if not encodings:
-            raise ValueError("No face detected in the uploaded image. Please try again with a clearer photo.")
+            raise ValueError("Could not extract facial features. Please retake photo with clearer lighting.")
         return encodings[0].tolist()
     else:
-        # Fallback when face_recognition is not installed
-        try:
-            img = Image.open(io.BytesIO(contents))
-            img.verify()
-        except Exception:
-            raise ValueError("Invalid image file uploaded.")
-        img_hash = hashlib.sha256(contents).digest()
-        rng = np.random.RandomState(int.from_bytes(img_hash[:4], 'big'))
-        return rng.randn(128).tolist()
+        raise ValueError("Face recognition engine is not installed on the server. Please ensure dlib/face_recognition is active.")
 
 
 def match_encoding(
@@ -425,7 +422,11 @@ app.add_middleware(
 @app.get("/health")
 @app.get("/api/health")
 async def health_check():
-    return {"status": "healthy", "message": "Face Recognition Attendance System API is running."}
+    return {
+        "status": "healthy",
+        "face_engine": "Real (dlib 128-d ResNet)" if USE_REAL_FR else "Unavailable",
+        "message": "Face Recognition Attendance System API is running.",
+    }
 
 
 @app.post("/register")
@@ -435,11 +436,14 @@ async def register_student(
     photo: UploadFile = File(..., description="A clear face photo of the student"),
 ):
     """
-    Register a new student.
+    Register a new student or update existing profile.
 
     Accepts a multipart form with `roll_no`, `name`, and a `photo` file.
     Extracts the 128-dimensional face encoding and stores it in the database.
     """
+    clean_roll = roll_no.strip().upper()
+    clean_name = name.strip()
+
     # --- Validate image & extract encoding ---
     try:
         encoding = await extract_face_encoding(photo)
@@ -451,20 +455,27 @@ async def register_student(
     # --- Persist to database ---
     db = await get_db()
     try:
-        # Check for duplicate roll number
+        # Check for existing student
         cursor = await db.execute(
-            "SELECT roll_no FROM students WHERE roll_no = ?", (roll_no,)
+            "SELECT roll_no, name FROM students WHERE roll_no = ?", (clean_roll,)
         )
         existing = await cursor.fetchone()
         if existing:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Student with roll number '{roll_no}' is already registered.",
+            # Update existing profile smoothly (handles reinstall/re-registration)
+            await db.execute(
+                "UPDATE students SET name = ?, face_encoding = ? WHERE roll_no = ?",
+                (clean_name, encoding_json, clean_roll),
             )
+            await db.commit()
+            return {
+                "status": "success",
+                "is_update": True,
+                "message": f"Student '{clean_name}' (Roll No: {clean_roll}) profile and face photo updated successfully.",
+            }
 
         await db.execute(
             "INSERT INTO students (roll_no, name, face_encoding) VALUES (?, ?, ?)",
-            (roll_no, name, encoding_json),
+            (clean_roll, clean_name, encoding_json),
         )
         await db.commit()
     finally:
@@ -472,7 +483,8 @@ async def register_student(
 
     return {
         "status": "success",
-        "message": f"Student '{name}' (Roll No: {roll_no}) registered successfully.",
+        "is_update": False,
+        "message": f"Student '{clean_name}' (Roll No: {clean_roll}) registered successfully.",
     }
 
 
@@ -532,6 +544,14 @@ async def verify_attendance(
         for student in students:
             known_encoding = json.loads(student["face_encoding"])
             is_match, distance = match_encoding(known_encoding, unknown_encoding)
+            logger.info(
+                "Face comparison: student=%s (%s), distance=%.4f, match=%s, threshold=%.2f",
+                student["name"],
+                student["roll_no"],
+                distance,
+                is_match,
+                FACE_MATCH_TOLERANCE,
+            )
             if is_match and distance < best_distance:
                 best_distance = distance
                 best_match_roll_no = student["roll_no"]
@@ -540,7 +560,7 @@ async def verify_attendance(
         if best_match_roll_no is None:
             raise HTTPException(
                 status_code=404,
-                detail="Face did not match any registered student.",
+                detail=f"Face did not match any registered student (Lowest distance: {best_distance:.2f}, required <= {FACE_MATCH_TOLERANCE:.2f}). Only registered students can mark attendance.",
             )
 
         # --- Prevent duplicate attendance for the same day ---
@@ -631,6 +651,30 @@ async def list_students():
 
     students = [{"roll_no": row["roll_no"], "name": row["name"]} for row in rows]
     return {"status": "success", "count": len(students), "students": students}
+
+
+@app.get("/students/{roll_no}")
+async def get_student_profile(roll_no: str):
+    """Fetch student profile by roll number to restore local session after app reinstall."""
+    clean_roll = roll_no.strip().upper()
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT roll_no, name FROM students WHERE roll_no = ?", (clean_roll,)
+        )
+        student = await cursor.fetchone()
+        if not student:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No registered student found with Roll Number '{clean_roll}'.",
+            )
+        return {
+            "status": "success",
+            "roll_no": student["roll_no"],
+            "name": student["name"],
+        }
+    finally:
+        await db.close()
 
 
 @app.delete("/students/{roll_no}")
