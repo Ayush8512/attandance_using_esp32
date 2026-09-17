@@ -1398,6 +1398,9 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       final uri = Uri.parse('$_serverUrl/verify');
       final request = http.MultipartRequest('POST', uri)
         ..files.add(await http.MultipartFile.fromPath('photo', path));
+      if (_studentRoll.isNotEmpty) {
+        request.fields['roll_no'] = _studentRoll;
+      }
 
       final streamed = await request.send().timeout(
             const Duration(seconds: 15),

@@ -35,6 +35,18 @@ export const api = {
     deleteStudent: (rollNo) => fetchWithHandler(`/students/${encodeURIComponent(rollNo)}`, {
         method: "DELETE"
     }),
+    unlockStudent: (rollNo) => fetchWithHandler(`/admin/students/${encodeURIComponent(rollNo)}/unlock`, {
+        method: "POST"
+    }),
+    lockStudent: (rollNo) => fetchWithHandler(`/admin/students/${encodeURIComponent(rollNo)}/lock`, {
+        method: "POST"
+    }),
+    getAdminSettings: () => fetchWithHandler("/admin/settings"),
+    toggleRegistration: (open) => fetchWithHandler("/admin/settings/registration", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ open })
+    }),
 
     // Attendance Records
     getAttendance: (rollNo = '', date = '') => {

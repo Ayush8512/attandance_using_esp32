@@ -295,10 +295,24 @@ async def init_db() -> None:
             CREATE TABLE IF NOT EXISTS students (
                 roll_no       TEXT PRIMARY KEY,
                 name          TEXT NOT NULL,
-                face_encoding TEXT NOT NULL   -- JSON-serialised list of 128 floats
+                face_encoding TEXT NOT NULL,  -- JSON-serialised list of 128 floats
+                is_locked     INTEGER NOT NULL DEFAULT 1,
+                created_at    TEXT,
+                updated_at    TEXT
             )
             """
         )
+        # Safe column migration for existing DB
+        for col in [
+            "ALTER TABLE students ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE students ADD COLUMN created_at TEXT",
+            "ALTER TABLE students ADD COLUMN updated_at TEXT",
+        ]:
+            try:
+                await db.execute(col)
+            except Exception:
+                pass
+
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS attendance (
@@ -306,11 +320,17 @@ async def init_db() -> None:
                 roll_no TEXT    NOT NULL,
                 date    TEXT    NOT NULL,       -- YYYY-MM-DD
                 time    TEXT    NOT NULL,       -- HH:MM:SS
+                subject TEXT    NOT NULL DEFAULT '',
                 status  TEXT    NOT NULL DEFAULT 'Present',
                 FOREIGN KEY (roll_no) REFERENCES students(roll_no)
             )
             """
         )
+        try:
+            await db.execute("ALTER TABLE attendance ADD COLUMN subject TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS timetable (
@@ -324,6 +344,18 @@ async def init_db() -> None:
                 UNIQUE(day, hour)
             )
             """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS system_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('registration_open', '1')"
         )
 
         # Seed timetable table from default entries if empty
@@ -436,46 +468,64 @@ async def register_student(
     photo: UploadFile = File(..., description="A clear face photo of the student"),
 ):
     """
-    Register a new student or update existing profile.
-
-    Accepts a multipart form with `roll_no`, `name`, and a `photo` file.
-    Extracts the 128-dimensional face encoding and stores it in the database.
+    Register a new student or update existing profile if unlocked by Admin.
+    Extracts the 128-dimensional face encoding and locks the biometric profile.
     """
     clean_roll = roll_no.strip().upper()
     clean_name = name.strip()
 
-    # --- Validate image & extract encoding ---
-    try:
-        encoding = await extract_face_encoding(photo)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    encoding_json = json.dumps(encoding)
-
-    # --- Persist to database ---
+    # --- Check Admin Registration Open setting ---
     db = await get_db()
     try:
+        setting_cur = await db.execute(
+            "SELECT value FROM system_settings WHERE key = 'registration_open'"
+        )
+        srow = await setting_cur.fetchone()
+        if srow and srow["value"] == "0":
+            raise HTTPException(
+                status_code=403,
+                detail="Student registration is currently CLOSED by College Administrator.",
+            )
+
         # Check for existing student
         cursor = await db.execute(
-            "SELECT roll_no, name FROM students WHERE roll_no = ?", (clean_roll,)
+            "SELECT roll_no, name, is_locked FROM students WHERE roll_no = ?", (clean_roll,)
         )
         existing = await cursor.fetchone()
+
+        # Security Protection: If student already exists and is locked, block re-registration
+        if existing and (existing["is_locked"] is None or existing["is_locked"] == 1):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Roll Number '{clean_roll}' is already locked with a registered biometric profile. Re-registration is blocked for security. Please ask your Teacher/Admin from dashboard to unlock your biometrics.",
+            )
+
+        # --- Validate image & extract encoding ---
+        try:
+            encoding = await extract_face_encoding(photo)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        encoding_json = json.dumps(encoding)
+        now_iso = datetime.now().isoformat()
+
         if existing:
-            # Update existing profile smoothly (handles reinstall/re-registration)
+            # Re-enroll student (previously unlocked by admin) and lock
             await db.execute(
-                "UPDATE students SET name = ?, face_encoding = ? WHERE roll_no = ?",
-                (clean_name, encoding_json, clean_roll),
+                "UPDATE students SET name = ?, face_encoding = ?, is_locked = 1, updated_at = ? WHERE roll_no = ?",
+                (clean_name, encoding_json, now_iso, clean_roll),
             )
             await db.commit()
             return {
                 "status": "success",
                 "is_update": True,
-                "message": f"Student '{clean_name}' (Roll No: {clean_roll}) profile and face photo updated successfully.",
+                "message": f"Biometric profile for '{clean_name}' (Roll No: {clean_roll}) updated and locked successfully.",
             }
 
+        # New registration: Insert and lock permanently
         await db.execute(
-            "INSERT INTO students (roll_no, name, face_encoding) VALUES (?, ?, ?)",
-            (clean_roll, clean_name, encoding_json),
+            "INSERT INTO students (roll_no, name, face_encoding, is_locked, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)",
+            (clean_roll, clean_name, encoding_json, now_iso, now_iso),
         )
         await db.commit()
     finally:
@@ -484,22 +534,18 @@ async def register_student(
     return {
         "status": "success",
         "is_update": False,
-        "message": f"Student '{clean_name}' (Roll No: {clean_roll}) registered successfully.",
+        "message": f"Student '{clean_name}' (Roll No: {clean_roll}) enrolled and locked successfully.",
     }
 
 
 @app.post("/verify")
 async def verify_attendance(
     photo: UploadFile = File(..., description="A live photo captured from the mobile app"),
+    roll_no: str | None = Form(None, description="Optional Roll Number for direct 1-to-1 biometric matching"),
 ):
     """
     Verify a student's identity and mark attendance.
-
-    Accepts a live photo, checks the server's current time against the timetable's
-    10-minute allowed window. If within the window, compares the face encoding against
-    all registered students, and marks the best match as **Present** in the attendance table.
-
-    A student can only be marked present **once per day**.
+    Supports direct 1-to-1 student matching (anti-proxy) and 1-to-many fallback.
     """
     # ── 1. Strict Time Window Check (Server Time) ──
     now = datetime.now()
@@ -524,65 +570,95 @@ async def verify_attendance(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # --- Load all registered students ---
+    current_subject = class_info.get("subject", "Class")
+
+    # --- Load students for matching ---
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT roll_no, name, face_encoding FROM students")
-        students = await cursor.fetchall()
-
-        if not students:
-            raise HTTPException(
-                status_code=404,
-                detail="No students are registered yet. Please register first.",
+        if roll_no and roll_no.strip():
+            # ── 1-to-1 Direct Identity Verification (Anti-Proxy Architecture) ──
+            clean_roll = roll_no.strip().upper()
+            cursor = await db.execute(
+                "SELECT roll_no, name, face_encoding FROM students WHERE roll_no = ?",
+                (clean_roll,),
             )
+            student = await cursor.fetchone()
+            if not student:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Student with Roll Number '{clean_roll}' is not enrolled on this server.",
+                )
 
-        # --- Find the best matching student ---
-        best_match_roll_no: str | None = None
-        best_match_name: str | None = None
-        best_distance: float = float("inf")
-
-        for student in students:
             known_encoding = json.loads(student["face_encoding"])
             is_match, distance = match_encoding(known_encoding, unknown_encoding)
             logger.info(
-                "Face comparison: student=%s (%s), distance=%.4f, match=%s, threshold=%.2f",
+                "1-to-1 Verification: roll=%s, name=%s, distance=%.4f (threshold=%.2f)",
+                clean_roll,
                 student["name"],
-                student["roll_no"],
                 distance,
-                is_match,
                 FACE_MATCH_TOLERANCE,
             )
-            if is_match and distance < best_distance:
-                best_distance = distance
-                best_match_roll_no = student["roll_no"]
-                best_match_name = student["name"]
 
-        if best_match_roll_no is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Face did not match any registered student (Lowest distance: {best_distance:.2f}, required <= {FACE_MATCH_TOLERANCE:.2f}). Only registered students can mark attendance.",
-            )
+            if not is_match:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Face mismatch! Live face (Distance: {distance:.2f}) does not match registered biometrics for {student['name']} ({clean_roll}). Proxy attendance strictly rejected.",
+                )
 
-        # --- Prevent duplicate attendance for the same day ---
+            matched_roll_no = student["roll_no"]
+            matched_name = student["name"]
+        else:
+            # ── 1-to-Many General Verification ──
+            cursor = await db.execute("SELECT roll_no, name, face_encoding FROM students")
+            students = await cursor.fetchall()
+            if not students:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No students are registered yet. Please register first.",
+                )
+
+            best_match_roll_no: str | None = None
+            best_match_name: str | None = None
+            best_distance: float = float("inf")
+
+            for student in students:
+                known_encoding = json.loads(student["face_encoding"])
+                is_match, distance = match_encoding(known_encoding, unknown_encoding)
+                if is_match and distance < best_distance:
+                    best_distance = distance
+                    best_match_roll_no = student["roll_no"]
+                    best_match_name = student["name"]
+
+            if best_match_roll_no is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Face did not match any registered student (Lowest distance: {best_distance:.2f} > tolerance {FACE_MATCH_TOLERANCE:.2f}). Only registered students can mark attendance.",
+                )
+
+            matched_roll_no = best_match_roll_no
+            matched_name = best_match_name
+
+        # --- Prevent duplicate attendance for the same student in THIS subject on today ---
         today = date.today().isoformat()
         dup_cursor = await db.execute(
-            "SELECT id FROM attendance WHERE roll_no = ? AND date = ?",
-            (best_match_roll_no, today),
+            "SELECT id FROM attendance WHERE roll_no = ? AND date = ? AND subject = ?",
+            (matched_roll_no, today, current_subject),
         )
         duplicate = await dup_cursor.fetchone()
         if duplicate:
             return {
                 "status": "already_marked",
-                "message": f"Attendance for '{best_match_name}' (Roll No: {best_match_roll_no}) is already marked for today.",
-                "roll_no": best_match_roll_no,
-                "name": best_match_name,
+                "message": f"Attendance for '{matched_name}' ({matched_roll_no}) is already marked for {current_subject} today.",
+                "roll_no": matched_roll_no,
+                "name": matched_name,
+                "subject": current_subject,
             }
 
         # --- Mark attendance ---
-        now = datetime.now()
+        now_time_str = now.strftime("%H:%M:%S")
         await db.execute(
-            "INSERT INTO attendance (roll_no, date, time, status) VALUES (?, ?, ?, ?)",
-            (best_match_roll_no, today, now.strftime("%H:%M:%S"), "Present"),
+            "INSERT INTO attendance (roll_no, date, time, subject, status) VALUES (?, ?, ?, ?, ?)",
+            (matched_roll_no, today, now_time_str, current_subject, "Present"),
         )
         await db.commit()
     finally:
@@ -590,11 +666,12 @@ async def verify_attendance(
 
     return {
         "status": "success",
-        "message": f"Attendance marked for '{best_match_name}' (Roll No: {best_match_roll_no}).",
-        "roll_no": best_match_roll_no,
-        "name": best_match_name,
+        "message": f"Attendance marked for '{matched_name}' (Roll No: {matched_roll_no}) in {current_subject}.",
+        "roll_no": matched_roll_no,
+        "name": matched_name,
+        "subject": current_subject,
         "date": today,
-        "time": now.strftime("%H:%M:%S"),
+        "time": now_time_str,
     }
 
 
@@ -608,7 +685,7 @@ async def get_attendance(
     """
     db = await get_db()
     try:
-        query = "SELECT a.roll_no, s.name, a.date, a.time, a.status FROM attendance a JOIN students s ON a.roll_no = s.roll_no WHERE 1=1"
+        query = "SELECT a.roll_no, s.name, a.date, a.time, a.subject, a.status FROM attendance a JOIN students s ON a.roll_no = s.roll_no WHERE 1=1"
         params: list = []
 
         if roll_no:
@@ -631,6 +708,7 @@ async def get_attendance(
             "name": row["name"],
             "date": row["date"],
             "time": row["time"],
+            "subject": row["subject"] or "",
             "status": row["status"],
         }
         for row in rows
@@ -641,16 +719,88 @@ async def get_attendance(
 
 @app.get("/students")
 async def list_students():
-    """List all registered students (without exposing face encodings)."""
+    """List all registered students with biometric lock status."""
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT roll_no, name FROM students ORDER BY roll_no")
+        cursor = await db.execute("SELECT roll_no, name, is_locked, created_at, updated_at FROM students ORDER BY roll_no")
         rows = await cursor.fetchall()
     finally:
         await db.close()
 
-    students = [{"roll_no": row["roll_no"], "name": row["name"]} for row in rows]
+    students = [
+        {
+            "roll_no": row["roll_no"],
+            "name": row["name"],
+            "is_locked": bool(row["is_locked"]) if row["is_locked"] is not None else True,
+            "created_at": row["created_at"] or "",
+            "updated_at": row["updated_at"] or "",
+        }
+        for row in rows
+    ]
     return {"status": "success", "count": len(students), "students": students}
+
+
+@app.post("/admin/students/{roll_no}/unlock")
+async def unlock_student_biometrics(roll_no: str):
+    """Admin unlocks student biometrics allowing them to re-register/update their face photo."""
+    clean_roll = roll_no.strip().upper()
+    db = await get_db()
+    try:
+        cur = await db.execute("UPDATE students SET is_locked = 0 WHERE roll_no = ?", (clean_roll,))
+        await db.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"Student with roll number '{clean_roll}' not found.")
+    finally:
+        await db.close()
+    return {"status": "success", "message": f"Biometrics for student '{clean_roll}' unlocked. Student can now re-register face photo."}
+
+
+@app.post("/admin/students/{roll_no}/lock")
+async def lock_student_biometrics(roll_no: str):
+    """Admin locks student biometrics to prevent re-registration."""
+    clean_roll = roll_no.strip().upper()
+    db = await get_db()
+    try:
+        cur = await db.execute("UPDATE students SET is_locked = 1 WHERE roll_no = ?", (clean_roll,))
+        await db.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"Student with roll number '{clean_roll}' not found.")
+    finally:
+        await db.close()
+    return {"status": "success", "message": f"Biometrics for student '{clean_roll}' locked."}
+
+
+@app.get("/admin/settings")
+async def get_admin_settings():
+    """Retrieve institution admin settings (registration window toggle)."""
+    db = await get_db()
+    try:
+        cur = await db.execute("SELECT key, value FROM system_settings")
+        rows = await cur.fetchall()
+    finally:
+        await db.close()
+    settings = {row["key"]: row["value"] for row in rows}
+    return {
+        "status": "success",
+        "registration_open": settings.get("registration_open", "1") == "1",
+    }
+
+
+@app.post("/admin/settings/registration")
+async def toggle_registration_setting(data: dict):
+    """Toggle registration open / closed for the institution."""
+    is_open = "1" if data.get("open", True) else "0"
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO system_settings (key, value) VALUES ('registration_open', ?) ON CONFLICT(key) DO UPDATE SET value = ?",
+            (is_open, is_open),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+    status_str = "OPEN" if is_open == "1" else "CLOSED"
+    return {"status": "success", "message": f"Student registration is now {status_str}.", "registration_open": is_open == "1"}
 
 
 @app.get("/students/{roll_no}")

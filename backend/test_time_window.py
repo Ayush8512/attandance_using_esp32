@@ -30,8 +30,11 @@ class TestStrictTimeWindow(unittest.TestCase):
     def setUp(self):
         self.client_context = TestClient(app)
         self.client = self.client_context.__enter__()
+        # Clean up test student if existed from previous run
+        self.client.delete("/students/ROLL_TEST_101")
 
     def tearDown(self):
+        self.client.delete("/students/ROLL_TEST_101")
         self.client_context.__exit__(None, None, None)
 
     def test_check_attendance_window_within_limit(self):
